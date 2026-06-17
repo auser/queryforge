@@ -1,4 +1,4 @@
-use queryforge_with_config_example::db;
+use queryforge_build_rs_example::db;
 
 fn main() {
     println!(
@@ -7,7 +7,7 @@ fn main() {
     );
     println!("get_user:\n{}", db::users::GET_USER_SQL);
     println!("list_users:\n{}", db::users::LIST_USERS_SQL);
-    println!("create_user:\n{}", db::users::CREATE_USER_SQL);
+    println!("insert_user:\n{}", db::users::INSERT_USER_SQL);
 
     tokio::runtime::Runtime::new()
         .unwrap()
@@ -26,25 +26,24 @@ async fn run() {
         "CREATE TABLE users (
             id INTEGER PRIMARY KEY,
             email TEXT NOT NULL,
-            name TEXT NOT NULL,
             created_at TEXT NOT NULL
-        )",
+        ) STRICT",
         (),
     )
     .await
     .unwrap();
 
-    db::users::create_user(
+    db::users::insert_user(
         &conn,
+        1,
         "a@example.com".to_string(),
-        "Ada".to_string(),
         "2026-06-17".to_string(),
     )
     .await
     .unwrap();
 
     let user = db::users::get_user(&conn, 1).await.unwrap();
-    println!("user: {} ({})", user.email, user.name);
+    println!("inserted user: {} at {}", user.email, user.created_at);
 
     let users = db::users::list_users(&conn).await.unwrap();
     println!("users: {}", users.len());

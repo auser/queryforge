@@ -67,6 +67,87 @@ impl From<Vec<u8>> for LibsqlValue {
     }
 }
 
+#[cfg(feature = "uuid-types")]
+impl From<uuid::Uuid> for LibsqlValue {
+    fn from(value: uuid::Uuid) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[cfg(feature = "serde-json-types")]
+impl From<serde_json::Value> for LibsqlValue {
+    fn from(value: serde_json::Value) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[cfg(feature = "decimal-types")]
+impl From<rust_decimal::Decimal> for LibsqlValue {
+    fn from(value: rust_decimal::Decimal) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[cfg(feature = "chrono-types")]
+impl From<chrono::NaiveDate> for LibsqlValue {
+    fn from(value: chrono::NaiveDate) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[cfg(feature = "chrono-types")]
+impl From<chrono::NaiveTime> for LibsqlValue {
+    fn from(value: chrono::NaiveTime) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[cfg(feature = "chrono-types")]
+impl From<chrono::NaiveDateTime> for LibsqlValue {
+    fn from(value: chrono::NaiveDateTime) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[cfg(feature = "chrono-types")]
+impl From<chrono::DateTime<chrono::Utc>> for LibsqlValue {
+    fn from(value: chrono::DateTime<chrono::Utc>) -> Self {
+        Self::Text(value.to_rfc3339())
+    }
+}
+
+#[cfg(feature = "time-types")]
+impl From<time::Date> for LibsqlValue {
+    fn from(value: time::Date) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[cfg(feature = "time-types")]
+impl From<time::Time> for LibsqlValue {
+    fn from(value: time::Time) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[cfg(feature = "time-types")]
+impl From<time::PrimitiveDateTime> for LibsqlValue {
+    fn from(value: time::PrimitiveDateTime) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+#[cfg(feature = "time-types")]
+impl From<time::OffsetDateTime> for LibsqlValue {
+    fn from(value: time::OffsetDateTime) -> Self {
+        Self::Text(
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_else(|_| value.to_string()),
+        )
+    }
+}
+
 impl<T> From<Option<T>> for LibsqlValue
 where
     T: Into<LibsqlValue>,
@@ -176,6 +257,170 @@ impl LibsqlDecode for Vec<u8> {
     }
 }
 
+#[cfg(feature = "uuid-types")]
+impl LibsqlDecode for uuid::Uuid {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("uuid::Uuid", value)?;
+        uuid::Uuid::parse_str(text).map_err(|err| {
+            Error::Backend(format!(
+                "failed to decode libSQL value as uuid::Uuid: {err}"
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "serde-json-types")]
+impl LibsqlDecode for serde_json::Value {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("serde_json::Value", value)?;
+        serde_json::from_str(text).map_err(|err| {
+            Error::Backend(format!(
+                "failed to decode libSQL value as serde_json::Value: {err}"
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "decimal-types")]
+impl LibsqlDecode for rust_decimal::Decimal {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("rust_decimal::Decimal", value)?;
+        text.parse::<rust_decimal::Decimal>().map_err(|err| {
+            Error::Backend(format!(
+                "failed to decode libSQL value as rust_decimal::Decimal: {err}"
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "chrono-types")]
+impl LibsqlDecode for chrono::NaiveDate {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("chrono::NaiveDate", value)?;
+        chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|err| {
+            Error::Backend(format!(
+                "failed to decode libSQL value as chrono::NaiveDate: {err}"
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "chrono-types")]
+impl LibsqlDecode for chrono::NaiveTime {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("chrono::NaiveTime", value)?;
+        chrono::NaiveTime::parse_from_str(text, "%H:%M:%S%.f").map_err(|err| {
+            Error::Backend(format!(
+                "failed to decode libSQL value as chrono::NaiveTime: {err}"
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "chrono-types")]
+impl LibsqlDecode for chrono::NaiveDateTime {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("chrono::NaiveDateTime", value)?;
+        chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f"))
+            .map_err(|err| {
+                Error::Backend(format!(
+                    "failed to decode libSQL value as chrono::NaiveDateTime: {err}"
+                ))
+            })
+    }
+}
+
+#[cfg(feature = "chrono-types")]
+impl LibsqlDecode for chrono::DateTime<chrono::Utc> {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("chrono::DateTime<chrono::Utc>", value)?;
+        chrono::DateTime::parse_from_rfc3339(text)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .map_err(|err| {
+                Error::Backend(format!(
+                    "failed to decode libSQL value as chrono::DateTime<chrono::Utc>: {err}"
+                ))
+            })
+    }
+}
+
+#[cfg(feature = "time-types")]
+impl LibsqlDecode for time::Date {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("time::Date", value)?;
+        time::Date::parse(
+            text,
+            time::macros::format_description!("[year]-[month]-[day]"),
+        )
+        .map_err(|err| {
+            Error::Backend(format!(
+                "failed to decode libSQL value as time::Date: {err}"
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "time-types")]
+impl LibsqlDecode for time::Time {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("time::Time", value)?;
+        time::Time::parse(
+            text,
+            time::macros::format_description!("[hour]:[minute]:[second].[subsecond]"),
+        )
+        .or_else(|_| {
+            time::Time::parse(
+                text,
+                time::macros::format_description!("[hour]:[minute]:[second]"),
+            )
+        })
+        .map_err(|err| {
+            Error::Backend(format!(
+                "failed to decode libSQL value as time::Time: {err}"
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "time-types")]
+impl LibsqlDecode for time::PrimitiveDateTime {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("time::PrimitiveDateTime", value)?;
+        time::PrimitiveDateTime::parse(
+            text,
+            time::macros::format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond]"
+            ),
+        )
+        .or_else(|_| {
+            time::PrimitiveDateTime::parse(
+                text,
+                time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
+            )
+        })
+        .map_err(|err| {
+            Error::Backend(format!(
+                "failed to decode libSQL value as time::PrimitiveDateTime: {err}"
+            ))
+        })
+    }
+}
+
+#[cfg(feature = "time-types")]
+impl LibsqlDecode for time::OffsetDateTime {
+    fn decode(value: &LibsqlValue) -> Result<Self> {
+        let text = decode_text("time::OffsetDateTime", value)?;
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).map_err(
+            |err| {
+                Error::Backend(format!(
+                    "failed to decode libSQL value as time::OffsetDateTime: {err}"
+                ))
+            },
+        )
+    }
+}
+
 impl<T> LibsqlDecode for Option<T>
 where
     T: LibsqlDecode,
@@ -192,6 +437,20 @@ fn decode_error(expected: &str, actual: &LibsqlValue) -> Error {
     Error::Backend(format!(
         "failed to decode libSQL value as {expected}: {actual:?}"
     ))
+}
+
+#[cfg(any(
+    feature = "uuid-types",
+    feature = "serde-json-types",
+    feature = "time-types",
+    feature = "chrono-types",
+    feature = "decimal-types"
+))]
+fn decode_text<'a>(expected: &str, value: &'a LibsqlValue) -> Result<&'a str> {
+    match value {
+        LibsqlValue::Text(value) => Ok(value),
+        other => Err(decode_error(expected, other)),
+    }
 }
 
 #[cfg(feature = "libsql-runtime")]
@@ -449,6 +708,49 @@ mod tests {
             LibsqlValue::Text("hello".to_string())
         );
         assert_eq!(LibsqlValue::from(None::<i64>), LibsqlValue::Null);
+    }
+
+    #[cfg(all(
+        feature = "uuid-types",
+        feature = "serde-json-types",
+        feature = "time-types",
+        feature = "chrono-types",
+        feature = "decimal-types"
+    ))]
+    #[test]
+    fn external_type_adapters_round_trip_text_values() {
+        let id = uuid::Uuid::nil();
+        let payload = serde_json::json!({ "ok": true });
+        let amount = rust_decimal::Decimal::new(1234, 2);
+        let time_value = time::OffsetDateTime::UNIX_EPOCH;
+        let chrono_value = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+
+        let row = LibsqlRow::new([
+            ("id", LibsqlValue::from(id)),
+            ("payload", LibsqlValue::from(payload.clone())),
+            ("amount", LibsqlValue::from(amount)),
+            ("time_value", LibsqlValue::from(time_value)),
+            ("chrono_value", LibsqlValue::from(chrono_value)),
+        ]);
+
+        assert_eq!(row.try_get::<uuid::Uuid>("id").unwrap(), id);
+        assert_eq!(
+            row.try_get::<serde_json::Value>("payload").unwrap(),
+            payload
+        );
+        assert_eq!(
+            row.try_get::<rust_decimal::Decimal>("amount").unwrap(),
+            amount
+        );
+        assert_eq!(
+            row.try_get::<time::OffsetDateTime>("time_value").unwrap(),
+            time_value
+        );
+        assert_eq!(
+            row.try_get::<chrono::DateTime<chrono::Utc>>("chrono_value")
+                .unwrap(),
+            chrono_value
+        );
     }
 
     #[test]

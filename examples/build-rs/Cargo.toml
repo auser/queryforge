@@ -7,4 +7,6 @@ edition = "2021"
 queryforge-build = { path = "../../crates/queryforge-build" }
 
 [dependencies]
-queryforge = { path = "../.." }
+libsql = { version = "0.10.0-pre.4", default-features = false, features = ["core"] }
+queryforge = { path = "../..", features = ["libsql-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

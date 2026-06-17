@@ -1,0 +1,23 @@
+[database]
+backend = "libsql"
+url = "file:catalog.db"
+
+[codegen]
+out_dir = "src/db"
+execution_target = "libsql-native"
+query_dir = "queries"
+
+[migrations]
+paths = []
+
+[build]
+default_output = "out-dir"
+offline = "auto"
+watch = [
+  "queryforge.toml",
+  "build.rs",
+  "queries"
+]
+
+[inference]
+unknown_expression_policy = "error"

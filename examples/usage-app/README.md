@@ -18,7 +18,7 @@ From the workspace root:
 cargo run -p queryforge-usage-app
 ```
 
-The binary prints the generated project fingerprint and the `get_user` SQL constant.
+The binary prints generated SQL constants, creates an in-memory libSQL database, and calls generated `get_user` and `list_users` functions.
 
 Run its execution test with:
 
@@ -34,4 +34,3 @@ The test creates an in-memory libSQL database and calls generated functions with
 - `src/main.rs` includes generated code and contains the native libSQL execution test.
 - `queryforge.toml` selects `libsql-native`.
 - `queries/users.sql` defines `get_user` and `list_users`.
-

@@ -1,5 +1,6 @@
-/target
+target/
 /src/db
 .queryforge/metadata.json
 .queryforge/
 *.db
+examples/postgres-e2e/Cargo.lock

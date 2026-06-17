@@ -1,0 +1,12 @@
+[package]
+name = "queryforge-sqlite-e2e-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+queryforge-build = { path = "../../crates/queryforge-build", features = ["sqlx-sqlite"] }
+
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

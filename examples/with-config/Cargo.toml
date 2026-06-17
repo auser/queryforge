@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[dependencies]
-# This assumes you copy this example into queryforge/examples/usage-app.
-# From there, ../.. points at the top-level queryforge crate.
-queryforge = { path = "../.." }
-
 [build-dependencies]
 queryforge-build = { path = "../../crates/queryforge-build" }
+
+[dependencies]
+libsql = { version = "0.10.0-pre.4", default-features = false, features = ["core"] }
+queryforge = { path = "../..", features = ["libsql-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

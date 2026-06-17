@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 default = []
 postgres = ["queryforge/postgres"]
 libsql = ["queryforge/libsql"]
+libsql-runtime = ["queryforge/libsql-runtime"]
 sqlx-postgres = ["queryforge/sqlx-postgres"]
 sqlx-sqlite = ["queryforge/sqlx-sqlite"]
 uuid-types = ["queryforge/uuid-types"]

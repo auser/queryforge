@@ -12,6 +12,7 @@ path = "src/main.rs"
 default = []
 postgres = ["queryforge/postgres"]
 libsql = ["queryforge/libsql"]
+libsql-runtime = ["queryforge/libsql-runtime"]
 sqlx-postgres = ["queryforge/sqlx-postgres"]
 sqlx-sqlite = ["queryforge/sqlx-sqlite"]
 uuid-types = ["queryforge/uuid-types"]

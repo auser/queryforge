@@ -1,0 +1,16 @@
+[package]
+name = "queryforge-postgres-e2e-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[build-dependencies]
+queryforge-build = { path = "../../crates/queryforge-build", features = ["postgres", "sqlx-postgres"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio-postgres = "0.7"
+
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

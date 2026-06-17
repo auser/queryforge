@@ -6,6 +6,10 @@ members = [
     "examples/build-rs",
     "examples/usage-app",
     "examples/with-config",
+    "examples/live-libsql-catalog",
+    "examples/crud",
+    "examples/sqlite-e2e",
+    "examples/type-mapping-profiles",
 ]
 resolver = "2"
 
@@ -24,11 +28,11 @@ libsql-runtime = ["dep:libsql", "dep:tokio"]
 sqlx-postgres = []
 sqlx-sqlite = []
 build-api = []
-uuid-types = []
-chrono-types = []
-time-types = []
-serde-json-types = []
-decimal-types = []
+uuid-types = ["dep:uuid"]
+chrono-types = ["dep:chrono"]
+time-types = ["dep:time"]
+serde-json-types = ["dep:serde_json"]
+decimal-types = ["dep:rust_decimal"]
 
 [dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
@@ -41,6 +45,12 @@ syn = { version = "2.0", features = ["full"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 libsql = { version = "0.10.0-pre.4", default-features = false, features = ["core"], optional = true }
+uuid = { version = "1", optional = true }
+chrono = { version = "0.4", optional = true }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"], optional = true }
+serde_json = { version = "1", optional = true }
+rust_decimal = { version = "1", optional = true }
+sqlparser = { version = "0.62.0", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

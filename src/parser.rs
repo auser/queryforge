@@ -114,18 +114,22 @@ fn parse_query_block(block: &str, path: &Path) -> Result<ParsedQuery> {
         )));
     }
 
+    let cardinality = header
+        .cardinality
+        .unwrap_or_else(|| infer_cardinality_from_sql(&sql));
+
     Ok(ParsedQuery {
         name: header.name,
         source_file: path.to_path_buf(),
         original_sql: sql,
-        cardinality: header.cardinality,
+        cardinality,
     })
 }
 
 #[derive(Debug, Clone)]
 struct QueryHeader {
     name: String,
-    cardinality: Cardinality,
+    cardinality: Option<Cardinality>,
 }
 
 fn query_header(input: &str) -> IResult<&str, QueryHeader> {
@@ -133,9 +137,14 @@ fn query_header(input: &str) -> IResult<&str, QueryHeader> {
     let (input, _) = space1.parse(input)?;
     let (input, name) = identifier.parse(input)?;
     let (input, _) = space0.parse(input)?;
-    let (input, _) = char(':').parse(input)?;
-    let (input, _) = space0.parse(input)?;
-    let (input, cardinality) = cardinality.parse(input)?;
+    let (input, has_cardinality) = opt(char(':')).parse(input)?;
+    let (input, cardinality) = if has_cardinality.is_some() {
+        let (input, _) = space0.parse(input)?;
+        let (input, cardinality) = cardinality.parse(input)?;
+        (input, Some(cardinality))
+    } else {
+        (input, None)
+    };
     let (input, _) = not_line_ending.parse(input)?;
     let (input, _) = opt(line_ending).parse(input)?;
 
@@ -167,6 +176,60 @@ fn is_ident_continue(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
+fn infer_cardinality_from_sql(sql: &str) -> Cardinality {
+    match first_sql_keyword(sql).as_deref() {
+        Some("select" | "with") => Cardinality::Many,
+        _ => Cardinality::Exec,
+    }
+}
+
+fn first_sql_keyword(sql: &str) -> Option<String> {
+    let bytes = sql.as_bytes();
+    let mut idx = 0;
+
+    while idx < bytes.len() {
+        while bytes.get(idx).is_some_and(u8::is_ascii_whitespace) {
+            idx += 1;
+        }
+
+        if bytes.get(idx..idx + 2) == Some(b"--") {
+            idx += 2;
+            while idx < bytes.len() && bytes[idx] != b'\n' {
+                idx += 1;
+            }
+            continue;
+        }
+
+        if bytes.get(idx..idx + 2) == Some(b"/*") {
+            idx += 2;
+            while idx + 1 < bytes.len() && bytes.get(idx..idx + 2) != Some(b"*/") {
+                idx += 1;
+            }
+            idx = (idx + 2).min(bytes.len());
+            continue;
+        }
+
+        if bytes
+            .get(idx)
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+        {
+            let start = idx;
+            idx += 1;
+            while bytes
+                .get(idx)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                idx += 1;
+            }
+            return Some(sql[start..idx].to_ascii_lowercase());
+        }
+
+        return None;
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +249,26 @@ mod tests {
         assert_eq!(parsed[0].source_file, Path::new("queries/users.sql"));
         assert_eq!(parsed[1].name, "list_users");
         assert_eq!(parsed[1].cardinality, Cardinality::Many);
+    }
+
+    #[test]
+    fn infers_cardinality_when_header_omits_it() {
+        let source = "--! insert_user\nINSERT INTO users (email) VALUES (:email);\n\n--! list_users\nSELECT id FROM users;";
+        let parsed = parse_queries(source, Path::new("queries/users.sql")).unwrap();
+
+        assert_eq!(parsed[0].name, "insert_user");
+        assert_eq!(parsed[0].cardinality, Cardinality::Exec);
+        assert_eq!(parsed[1].name, "list_users");
+        assert_eq!(parsed[1].cardinality, Cardinality::Many);
+    }
+
+    #[test]
+    fn explicit_cardinality_overrides_sql_inference() {
+        let source =
+            "--! insert_user : one\nINSERT INTO users (email) VALUES (:email) RETURNING id;";
+        let parsed = parse_queries(source, Path::new("queries/users.sql")).unwrap();
+
+        assert_eq!(parsed[0].cardinality, Cardinality::One);
     }
 
     #[test]

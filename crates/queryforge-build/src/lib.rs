@@ -21,6 +21,11 @@ impl GenerateBuilder {
         self
     }
 
+    pub fn output_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.inner = self.inner.output_dir(path);
+        self
+    }
+
     pub fn watch(mut self, path: impl Into<PathBuf>) -> Self {
         self.inner = self.inner.watch(path);
         self

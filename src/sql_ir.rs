@@ -3,6 +3,14 @@ use nom::character::complete::{char, multispace0, multispace1};
 use nom::combinator::{map, opt, recognize};
 use nom::sequence::delimited;
 use nom::{IResult, Parser};
+use sqlparser::ast::{
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
+    JoinOperator, ObjectName, ObjectNamePart, Query, Select, SelectItem,
+    SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
+    Statement as AstStatement, TableAlias, TableFactor, TableWithJoins, Value,
+};
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
+use sqlparser::parser::Parser as SqlParser;
 
 use crate::error::{Error, Result};
 
@@ -45,7 +53,9 @@ pub struct SelectStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommonTableExpression {
     pub name: String,
+    pub columns: Vec<String>,
     pub query: String,
+    pub recursive: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +77,7 @@ pub struct TableReference {
     pub name: String,
     pub alias: Option<String>,
     pub derived_query: Option<String>,
+    pub lateral: bool,
     pub nullable: bool,
 }
 
@@ -130,6 +141,676 @@ pub fn parse_create_table(sql: &str) -> Result<Option<CreateTableStatement>> {
 }
 
 pub fn parse_select(sql: &str) -> Option<SelectStatement> {
+    parse_select_with_sqlparser(sql).or_else(|| parse_select_heuristic(sql))
+}
+
+fn parse_select_with_sqlparser(sql: &str) -> Option<SelectStatement> {
+    let cleaned = trim_trailing_semicolon(sql.trim());
+    let statement = parse_sqlparser_statement(cleaned)?;
+    let AstStatement::Query(query) = statement else {
+        return None;
+    };
+    lower_query(&query)
+}
+
+fn parse_sqlparser_statement(sql: &str) -> Option<AstStatement> {
+    let postgres = PostgreSqlDialect {};
+    let sqlite = SQLiteDialect {};
+
+    for dialect in [
+        &postgres as &dyn sqlparser::dialect::Dialect,
+        &sqlite as &dyn sqlparser::dialect::Dialect,
+    ] {
+        let Ok(mut statements) = SqlParser::parse_sql(dialect, sql) else {
+            continue;
+        };
+        if statements.len() == 1 {
+            return statements.pop();
+        }
+    }
+
+    None
+}
+
+fn lower_query(query: &Query) -> Option<SelectStatement> {
+    let ctes = query
+        .with
+        .as_ref()
+        .map(|with| {
+            with.cte_tables
+                .iter()
+                .map(|cte| CommonTableExpression {
+                    name: cte.alias.name.value.clone(),
+                    columns: cte
+                        .alias
+                        .columns
+                        .iter()
+                        .map(|column| column.name.value.clone())
+                        .collect(),
+                    query: cte.query.to_string(),
+                    recursive: with.recursive,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (select, compound) = lower_set_expr(&query.body)?;
+    let projections = select.projection.iter().map(lower_select_item).collect();
+    let table_refs = lower_table_with_joins(&select.from);
+    let table = table_refs
+        .first()
+        .map(|table_ref| table_ref.name.clone())
+        .unwrap_or_default();
+    let equality_params = if compound.is_empty() {
+        infer_equality_param_pairs_from_query(query, true)
+    } else {
+        infer_equality_param_pairs_from_select(select)
+    };
+
+    Some(SelectStatement {
+        ctes,
+        projections,
+        table,
+        table_refs,
+        equality_params,
+        compound,
+    })
+}
+
+fn infer_equality_param_pairs_from_query(
+    query: &Query,
+    include_compound_branches: bool,
+) -> Vec<EqualityParam> {
+    let mut pairs = Vec::new();
+    collect_query_equality_params(query, include_compound_branches, &mut pairs);
+    pairs
+}
+
+fn infer_equality_param_pairs_from_select(select: &Select) -> Vec<EqualityParam> {
+    let mut pairs = Vec::new();
+    collect_select_equality_params(select, &mut pairs);
+    pairs
+}
+
+fn collect_query_equality_params(
+    query: &Query,
+    include_compound_branches: bool,
+    pairs: &mut Vec<EqualityParam>,
+) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            collect_query_equality_params(&cte.query, true, pairs);
+        }
+    }
+    collect_set_expr_equality_params(&query.body, include_compound_branches, pairs);
+}
+
+fn collect_set_expr_equality_params(
+    set_expr: &SetExpr,
+    include_compound_branches: bool,
+    pairs: &mut Vec<EqualityParam>,
+) {
+    match set_expr {
+        SetExpr::Select(select) => collect_select_equality_params(select, pairs),
+        SetExpr::Query(query) => {
+            collect_query_equality_params(query, include_compound_branches, pairs);
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_set_expr_equality_params(left, include_compound_branches, pairs);
+            if include_compound_branches {
+                collect_set_expr_equality_params(right, include_compound_branches, pairs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_select_equality_params(select: &Select, pairs: &mut Vec<EqualityParam>) {
+    for projection in &select.projection {
+        match projection {
+            SelectItem::UnnamedExpr(expr)
+            | SelectItem::ExprWithAlias { expr, .. }
+            | SelectItem::ExprWithAliases { expr, .. } => collect_expr_equality_params(expr, pairs),
+            SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {}
+        }
+    }
+
+    collect_table_sources_equality_params(&select.from, pairs);
+
+    if let Some(selection) = &select.selection {
+        collect_expr_equality_params(selection, pairs);
+    }
+    if let Some(having) = &select.having {
+        collect_expr_equality_params(having, pairs);
+    }
+}
+
+fn collect_table_sources_equality_params(
+    table_with_joins: &[TableWithJoins],
+    pairs: &mut Vec<EqualityParam>,
+) {
+    for table_with_join in table_with_joins {
+        collect_table_factor_equality_params(&table_with_join.relation, pairs);
+        for join in &table_with_join.joins {
+            collect_table_factor_equality_params(&join.relation, pairs);
+            collect_join_constraint_equality_params(&join.join_operator, pairs);
+        }
+    }
+}
+
+fn collect_table_factor_equality_params(
+    table_factor: &TableFactor,
+    pairs: &mut Vec<EqualityParam>,
+) {
+    match table_factor {
+        TableFactor::Derived { subquery, .. } => {
+            collect_query_equality_params(subquery, true, pairs)
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => collect_table_sources_equality_params(std::slice::from_ref(table_with_joins), pairs),
+        TableFactor::TableFunction { expr, .. } => collect_expr_equality_params(expr, pairs),
+        TableFactor::Function { args, .. } => {
+            for arg in args {
+                collect_function_arg_equality_params(arg, pairs);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_join_constraint_equality_params(
+    operator: &JoinOperator,
+    pairs: &mut Vec<EqualityParam>,
+) {
+    let constraint = match operator {
+        JoinOperator::Join(constraint)
+        | JoinOperator::Inner(constraint)
+        | JoinOperator::Left(constraint)
+        | JoinOperator::LeftOuter(constraint)
+        | JoinOperator::Right(constraint)
+        | JoinOperator::RightOuter(constraint)
+        | JoinOperator::FullOuter(constraint)
+        | JoinOperator::CrossJoin(constraint)
+        | JoinOperator::Semi(constraint)
+        | JoinOperator::LeftSemi(constraint)
+        | JoinOperator::RightSemi(constraint)
+        | JoinOperator::Anti(constraint)
+        | JoinOperator::LeftAnti(constraint)
+        | JoinOperator::RightAnti(constraint)
+        | JoinOperator::StraightJoin(constraint)
+        | JoinOperator::AsOf { constraint, .. } => constraint,
+        JoinOperator::CrossApply
+        | JoinOperator::OuterApply
+        | JoinOperator::ArrayJoin
+        | JoinOperator::LeftArrayJoin
+        | JoinOperator::InnerArrayJoin => return,
+    };
+
+    if let JoinConstraint::On(expr) = constraint {
+        collect_expr_equality_params(expr, pairs);
+    }
+}
+
+fn collect_expr_equality_params(expr: &Expr, pairs: &mut Vec<EqualityParam>) {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if *op == BinaryOperator::Eq {
+                if let Some(pair) = equality_param_from_exprs(left, right) {
+                    pairs.push(pair);
+                }
+            }
+            collect_expr_equality_params(left, pairs);
+            collect_expr_equality_params(right, pairs);
+        }
+        Expr::Nested(expr)
+        | Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Convert { expr, .. }
+        | Expr::Extract { expr, .. }
+        | Expr::Ceil { expr, .. }
+        | Expr::Floor { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::Prefixed { value: expr, .. }
+        | Expr::Named { expr, .. } => collect_expr_equality_params(expr, pairs),
+        Expr::AtTimeZone {
+            timestamp,
+            time_zone,
+        } => {
+            collect_expr_equality_params(timestamp, pairs);
+            collect_expr_equality_params(time_zone, pairs);
+        }
+        Expr::Position { expr, r#in } => {
+            collect_expr_equality_params(expr, pairs);
+            collect_expr_equality_params(r#in, pairs);
+        }
+        Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            collect_expr_equality_params(expr, pairs);
+            if let Some(substring_from) = substring_from {
+                collect_expr_equality_params(substring_from, pairs);
+            }
+            if let Some(substring_for) = substring_for {
+                collect_expr_equality_params(substring_for, pairs);
+            }
+        }
+        Expr::Trim {
+            trim_what,
+            expr,
+            trim_characters,
+            ..
+        } => {
+            if let Some(trim_what) = trim_what {
+                collect_expr_equality_params(trim_what, pairs);
+            }
+            collect_expr_equality_params(expr, pairs);
+            if let Some(trim_characters) = trim_characters {
+                for trim_character in trim_characters {
+                    collect_expr_equality_params(trim_character, pairs);
+                }
+            }
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            collect_expr_equality_params(expr, pairs);
+            collect_expr_equality_params(overlay_what, pairs);
+            collect_expr_equality_params(overlay_from, pairs);
+            if let Some(overlay_for) = overlay_for {
+                collect_expr_equality_params(overlay_for, pairs);
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                collect_expr_equality_params(operand, pairs);
+            }
+            for condition in conditions {
+                collect_expr_equality_params(&condition.condition, pairs);
+                collect_expr_equality_params(&condition.result, pairs);
+            }
+            if let Some(else_result) = else_result {
+                collect_expr_equality_params(else_result, pairs);
+            }
+        }
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
+            collect_query_equality_params(subquery, true, pairs);
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            collect_expr_equality_params(expr, pairs);
+            collect_query_equality_params(subquery, true, pairs);
+        }
+        Expr::InList { expr, list, .. } => {
+            collect_expr_equality_params(expr, pairs);
+            for item in list {
+                collect_expr_equality_params(item, pairs);
+            }
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_equality_params(expr, pairs);
+            collect_expr_equality_params(low, pairs);
+            collect_expr_equality_params(high, pairs);
+        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => {
+            collect_expr_equality_params(expr, pairs);
+            collect_expr_equality_params(pattern, pairs);
+        }
+        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
+            collect_expr_equality_params(left, pairs);
+            collect_expr_equality_params(right, pairs);
+        }
+        Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr) => collect_expr_equality_params(expr, pairs),
+        Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
+            collect_expr_equality_params(left, pairs);
+            collect_expr_equality_params(right, pairs);
+        }
+        Expr::IsNormalized { expr, .. } => collect_expr_equality_params(expr, pairs),
+        Expr::Function(function) => {
+            collect_function_arguments_equality_params(&function.parameters, pairs);
+            collect_function_arguments_equality_params(&function.args, pairs);
+            if let Some(filter) = &function.filter {
+                collect_expr_equality_params(filter, pairs);
+            }
+        }
+        Expr::Tuple(items) => {
+            for item in items {
+                collect_expr_equality_params(item, pairs);
+            }
+        }
+        Expr::Struct { values, .. } => {
+            for value in values {
+                collect_expr_equality_params(value, pairs);
+            }
+        }
+        Expr::GroupingSets(groups) | Expr::Cube(groups) | Expr::Rollup(groups) => {
+            for group in groups {
+                for item in group {
+                    collect_expr_equality_params(item, pairs);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_function_arguments_equality_params(
+    arguments: &FunctionArguments,
+    pairs: &mut Vec<EqualityParam>,
+) {
+    match arguments {
+        FunctionArguments::None => {}
+        FunctionArguments::Subquery(query) => collect_query_equality_params(query, true, pairs),
+        FunctionArguments::List(arguments) => {
+            for arg in &arguments.args {
+                collect_function_arg_equality_params(arg, pairs);
+            }
+        }
+    }
+}
+
+fn collect_function_arg_equality_params(arg: &FunctionArg, pairs: &mut Vec<EqualityParam>) {
+    match arg {
+        FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => {
+            collect_function_arg_expr_equality_params(arg, pairs);
+        }
+        FunctionArg::ExprNamed { name, arg, .. } => {
+            collect_expr_equality_params(name, pairs);
+            collect_function_arg_expr_equality_params(arg, pairs);
+        }
+    }
+}
+
+fn collect_function_arg_expr_equality_params(
+    arg: &FunctionArgExpr,
+    pairs: &mut Vec<EqualityParam>,
+) {
+    if let FunctionArgExpr::Expr(expr) = arg {
+        collect_expr_equality_params(expr, pairs);
+    }
+}
+
+fn equality_param_from_exprs(left: &Expr, right: &Expr) -> Option<EqualityParam> {
+    if let (Some((qualifier, column)), Some(param)) =
+        (column_name_from_expr(left), named_param_from_expr(right))
+    {
+        return Some(EqualityParam {
+            qualifier,
+            column,
+            param,
+        });
+    }
+
+    let (Some((qualifier, column)), Some(param)) =
+        (column_name_from_expr(right), named_param_from_expr(left))
+    else {
+        return None;
+    };
+    Some(EqualityParam {
+        qualifier,
+        column,
+        param,
+    })
+}
+
+fn column_name_from_expr(expr: &Expr) -> Option<(Option<String>, String)> {
+    match expr {
+        Expr::Identifier(ident) => Some((None, ident.value.clone())),
+        Expr::CompoundIdentifier(idents) => {
+            let column = idents.last()?.value.clone();
+            let qualifier = match idents.len() {
+                0 | 1 => None,
+                _ => Some(
+                    idents[..idents.len() - 1]
+                        .iter()
+                        .map(|ident| ident.value.clone())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                ),
+            };
+            Some((qualifier, column))
+        }
+        Expr::Nested(expr) | Expr::Cast { expr, .. } => column_name_from_expr(expr),
+        _ => None,
+    }
+}
+
+fn named_param_from_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(value) => {
+            let Value::Placeholder(name) = &value.value else {
+                return None;
+            };
+            name.strip_prefix(':').map(ToString::to_string)
+        }
+        Expr::Nested(expr) | Expr::Cast { expr, .. } => named_param_from_expr(expr),
+        _ => None,
+    }
+}
+
+fn lower_set_expr(set_expr: &SetExpr) -> Option<(&Select, Vec<CompoundSelect>)> {
+    match set_expr {
+        SetExpr::Select(select) => Some((select, Vec::new())),
+        SetExpr::Query(query) => lower_set_expr(&query.body),
+        SetExpr::SetOperation {
+            left,
+            op,
+            set_quantifier,
+            right,
+        } => {
+            let (select, mut compound) = lower_set_expr(left)?;
+            collect_compound_selects(right, *op, *set_quantifier, &mut compound);
+            Some((select, compound))
+        }
+        _ => None,
+    }
+}
+
+fn collect_compound_selects(
+    set_expr: &SetExpr,
+    op: SetOperator,
+    quantifier: SetQuantifier,
+    compound: &mut Vec<CompoundSelect>,
+) {
+    match set_expr {
+        SetExpr::SetOperation {
+            left,
+            op: next_op,
+            set_quantifier: next_quantifier,
+            right,
+        } => {
+            compound.push(CompoundSelect {
+                operator: lower_compound_operator(op, quantifier),
+                query: left.to_string(),
+            });
+            collect_compound_selects(right, *next_op, *next_quantifier, compound);
+        }
+        SetExpr::Query(query) => collect_compound_selects(&query.body, op, quantifier, compound),
+        other => compound.push(CompoundSelect {
+            operator: lower_compound_operator(op, quantifier),
+            query: other.to_string(),
+        }),
+    }
+}
+
+fn lower_compound_operator(op: SetOperator, quantifier: SetQuantifier) -> CompoundOperator {
+    match op {
+        SetOperator::Union if quantifier == SetQuantifier::All => CompoundOperator::UnionAll,
+        SetOperator::Union => CompoundOperator::Union,
+        SetOperator::Intersect => CompoundOperator::Intersect,
+        SetOperator::Except | SetOperator::Minus => CompoundOperator::Except,
+    }
+}
+
+fn lower_select_item(item: &SelectItem) -> SelectProjection {
+    match item {
+        SelectItem::UnnamedExpr(expr) => SelectProjection {
+            expr: expr.to_string(),
+            alias: None,
+        },
+        SelectItem::ExprWithAlias { expr, alias } => SelectProjection {
+            expr: expr.to_string(),
+            alias: Some(alias.value.clone()),
+        },
+        SelectItem::ExprWithAliases { expr, aliases } => SelectProjection {
+            expr: expr.to_string(),
+            alias: aliases.first().map(|alias| alias.value.clone()),
+        },
+        SelectItem::QualifiedWildcard(kind, _) => SelectProjection {
+            expr: match kind {
+                SelectItemQualifiedWildcardKind::ObjectName(name) => {
+                    format!("{}.*", object_name_to_string(name))
+                }
+                SelectItemQualifiedWildcardKind::Expr(expr) => format!("{expr}.*"),
+            },
+            alias: None,
+        },
+        SelectItem::Wildcard(_) => SelectProjection {
+            expr: "*".to_string(),
+            alias: None,
+        },
+    }
+}
+
+fn lower_table_with_joins(table_with_joins: &[TableWithJoins]) -> Vec<TableReference> {
+    let mut refs = Vec::new();
+    for table_with_join in table_with_joins {
+        refs.extend(lower_table_factor(&table_with_join.relation, false));
+        for join in &table_with_join.joins {
+            let nullability = join_nullability_from_operator(&join.join_operator);
+            if nullability.previous_nullable {
+                for table_ref in &mut refs {
+                    table_ref.nullable = true;
+                }
+            }
+
+            let mut joined_refs = lower_table_factor(&join.relation, nullability.joined_nullable);
+            refs.append(&mut joined_refs);
+        }
+    }
+    refs
+}
+
+fn lower_table_factor(table_factor: &TableFactor, nullable: bool) -> Vec<TableReference> {
+    match table_factor {
+        TableFactor::Table { name, alias, .. } => vec![TableReference {
+            name: object_name_to_string(name),
+            alias: alias_name(alias),
+            derived_query: None,
+            lateral: false,
+            nullable,
+        }],
+        TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+            ..
+        } => {
+            let alias = alias_name(alias).unwrap_or_else(|| "subquery".to_string());
+            vec![TableReference {
+                name: alias.clone(),
+                alias: Some(alias),
+                derived_query: Some(subquery.to_string()),
+                lateral: *lateral,
+                nullable,
+            }]
+        }
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias: _,
+        } => {
+            let mut refs = lower_table_with_joins(std::slice::from_ref(table_with_joins));
+            if nullable {
+                for table_ref in &mut refs {
+                    table_ref.nullable = true;
+                }
+            }
+            refs
+        }
+        TableFactor::TableFunction { expr, alias } => vec![TableReference {
+            name: alias_name(alias).unwrap_or_else(|| expr.to_string()),
+            alias: alias_name(alias),
+            derived_query: None,
+            lateral: false,
+            nullable,
+        }],
+        TableFactor::Function {
+            lateral,
+            name,
+            alias,
+            ..
+        } => vec![TableReference {
+            name: alias_name(alias).unwrap_or_else(|| object_name_to_string(name)),
+            alias: alias_name(alias),
+            derived_query: None,
+            lateral: *lateral,
+            nullable,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn join_nullability_from_operator(operator: &JoinOperator) -> JoinNullability {
+    match operator {
+        JoinOperator::Left(_) | JoinOperator::LeftOuter(_) | JoinOperator::OuterApply => {
+            JoinNullability {
+                previous_nullable: false,
+                joined_nullable: true,
+            }
+        }
+        JoinOperator::Right(_) | JoinOperator::RightOuter(_) => JoinNullability {
+            previous_nullable: true,
+            joined_nullable: false,
+        },
+        JoinOperator::FullOuter(_) => JoinNullability {
+            previous_nullable: true,
+            joined_nullable: true,
+        },
+        _ => JoinNullability {
+            previous_nullable: false,
+            joined_nullable: false,
+        },
+    }
+}
+
+fn object_name_to_string(name: &ObjectName) -> String {
+    name.0
+        .iter()
+        .map(|part| match part {
+            ObjectNamePart::Identifier(ident) => ident.value.clone(),
+            ObjectNamePart::Function(function) => function.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn alias_name(alias: &Option<TableAlias>) -> Option<String> {
+    alias.as_ref().map(|alias| alias.name.value.clone())
+}
+
+fn parse_select_heuristic(sql: &str) -> Option<SelectStatement> {
     let cleaned = trim_trailing_semicolon(sql.trim());
     let (select_sql, ctes) = split_leading_ctes(cleaned)?;
     let (select_sql, compound) = split_compound_selects(select_sql);
@@ -137,12 +818,20 @@ pub fn parse_select(sql: &str) -> Option<SelectStatement> {
         return None;
     };
     let select_len = select_sql.len() - after_select.len();
-    let from_idx = find_keyword_top_level(select_sql, "from")?;
-    let projection_sql = select_sql[select_len..from_idx].trim();
-    let after_from = select_sql[from_idx + "from".len()..].trim();
-    let from_clause = leading_from_clause(after_from);
-    let table_refs = parse_table_references(from_clause);
-    let table = table_refs.first()?.name.clone();
+    let (projection_sql, table_refs) =
+        if let Some(from_idx) = find_keyword_top_level(select_sql, "from") {
+            let projection_sql = select_sql[select_len..from_idx].trim();
+            let after_from = select_sql[from_idx + "from".len()..].trim();
+            let from_clause = leading_from_clause(after_from);
+            (projection_sql, parse_table_references(from_clause))
+        } else {
+            let after_select = select_sql[select_len..].trim();
+            (leading_projection_clause(after_select), Vec::new())
+        };
+    let table = table_refs
+        .first()
+        .map(|table_ref| table_ref.name.clone())
+        .unwrap_or_default();
 
     let projections = split_comma_separated(projection_sql)
         .into_iter()
@@ -251,13 +940,22 @@ fn split_leading_ctes(sql: &str) -> Option<(&str, Vec<CommonTableExpression>)> {
     }
 
     let mut rest = sql["with".len()..].trim_start();
+    let recursive = starts_with_keyword(rest, "recursive");
+    if recursive {
+        rest = rest["recursive".len()..].trim_start();
+    }
     let mut ctes = Vec::new();
     loop {
         let (name, name_len) = parse_identifier_prefix(rest)?;
         rest = rest[name_len..].trim_start();
 
+        let mut columns = Vec::new();
         if rest.starts_with('(') {
             let close = find_matching_paren(rest, 0)?;
+            columns = split_comma_separated(&rest[1..close])
+                .into_iter()
+                .map(|column| strip_identifier_quotes(column).to_string())
+                .collect();
             rest = rest[close + 1..].trim_start();
         }
 
@@ -271,7 +969,9 @@ fn split_leading_ctes(sql: &str) -> Option<(&str, Vec<CommonTableExpression>)> {
         let close = find_matching_paren(rest, 0)?;
         ctes.push(CommonTableExpression {
             name: strip_identifier_quotes(&name).to_string(),
+            columns,
             query: rest[1..close].trim().to_string(),
+            recursive,
         });
         rest = rest[close + 1..].trim_start();
 
@@ -445,12 +1145,29 @@ fn leading_from_clause(after_from: &str) -> &str {
     after_from[..end].trim()
 }
 
+fn leading_projection_clause(after_select: &str) -> &str {
+    let mut end = after_select.len();
+    for keyword in ["where", "group", "order", "limit", "having", "returning"] {
+        if let Some(idx) = find_keyword_top_level(after_select, keyword) {
+            end = end.min(idx);
+        }
+    }
+    after_select[..end].trim()
+}
+
 fn parse_table_references(from_clause: &str) -> Vec<TableReference> {
+    split_comma_separated(from_clause)
+        .into_iter()
+        .flat_map(parse_joined_table_references)
+        .collect()
+}
+
+fn parse_joined_table_references(from_clause: &str) -> Vec<TableReference> {
     let mut refs = Vec::new();
     let mut rest = from_clause.trim();
 
-    if let Some((table_ref, consumed)) = parse_table_reference_prefix(rest, false) {
-        refs.push(table_ref);
+    if let Some((table_refs, consumed)) = parse_table_reference_prefix(rest, false) {
+        refs.extend(table_refs);
         rest = rest[consumed..].trim_start();
     }
 
@@ -464,10 +1181,10 @@ fn parse_table_references(from_clause: &str) -> Vec<TableReference> {
             }
         }
         rest = rest[join_idx + "join".len()..].trim_start();
-        if let Some((table_ref, consumed)) =
+        if let Some((table_refs, consumed)) =
             parse_table_reference_prefix(rest, join_nullability.joined_nullable)
         {
-            refs.push(table_ref);
+            refs.extend(table_refs);
             rest = rest[consumed..].trim_start();
         } else {
             break;
@@ -523,25 +1240,54 @@ fn join_nullability_from_tokens(tokens: &[String]) -> JoinNullability {
     join_nullability_before(tokens, tokens.len())
 }
 
-fn parse_table_reference_prefix(input: &str, nullable: bool) -> Option<(TableReference, usize)> {
+fn parse_table_reference_prefix(
+    input: &str,
+    nullable: bool,
+) -> Option<(Vec<TableReference>, usize)> {
     let leading_ws = input.len() - input.trim_start().len();
-    let input = input.trim_start();
+    let mut input = input.trim_start();
+    let mut lateral = false;
+    let mut prefix_consumed = 0;
+
+    if starts_with_keyword(input, "lateral") {
+        lateral = true;
+        let after_lateral = input["lateral".len()..].trim_start();
+        prefix_consumed += "lateral".len() + input["lateral".len()..].len() - after_lateral.len();
+        input = after_lateral;
+    }
+
     if input.starts_with('(') {
         let close = find_matching_paren(input, 0)?;
-        let derived_query = input[1..close].trim().to_string();
+        let inner = input[1..close].trim();
         let mut consumed = close + 1;
-        let (alias, alias_len) = parse_optional_alias(&input[consumed..]);
+        if starts_with_keyword(inner, "select") || starts_with_keyword(inner, "with") {
+            let (alias, alias_len) = parse_optional_alias(&input[consumed..]);
+            consumed += alias_len;
+            let alias = alias.unwrap_or_else(|| "subquery".to_string());
+            return Some((
+                vec![TableReference {
+                    name: alias.clone(),
+                    alias: Some(alias),
+                    derived_query: Some(inner.to_string()),
+                    lateral,
+                    nullable,
+                }],
+                leading_ws + prefix_consumed + consumed,
+            ));
+        }
+
+        let mut table_refs = parse_table_references(inner);
+        if table_refs.is_empty() {
+            return None;
+        }
+        if nullable {
+            for table_ref in &mut table_refs {
+                table_ref.nullable = true;
+            }
+        }
+        let (_alias, alias_len) = parse_optional_alias(&input[consumed..]);
         consumed += alias_len;
-        let alias = alias.unwrap_or_else(|| "subquery".to_string());
-        return Some((
-            TableReference {
-                name: alias.clone(),
-                alias: Some(alias),
-                derived_query: Some(derived_query),
-                nullable,
-            },
-            leading_ws + consumed,
-        ));
+        return Some((table_refs, leading_ws + prefix_consumed + consumed));
     }
 
     let (table, table_len) = parse_identifier_prefix(input)?;
@@ -554,13 +1300,14 @@ fn parse_table_reference_prefix(input: &str, nullable: bool) -> Option<(TableRef
     consumed += alias_len;
 
     Some((
-        TableReference {
+        vec![TableReference {
             name: table,
             alias,
             derived_query: None,
+            lateral,
             nullable,
-        },
-        leading_ws + consumed,
+        }],
+        leading_ws + prefix_consumed + consumed,
     ))
 }
 
@@ -599,6 +1346,7 @@ fn is_from_join_keyword(value: &str) -> bool {
             | "full"
             | "cross"
             | "natural"
+            | "lateral"
             | "group"
             | "order"
             | "limit"
@@ -1046,6 +1794,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_select_without_from_into_ir() {
+        let statement =
+            parse_select("SELECT u.email || '' AS email_expr, :id AS requested_id WHERE true")
+                .unwrap();
+
+        assert_eq!(statement.table, "");
+        assert!(statement.table_refs.is_empty());
+        assert_eq!(statement.projections.len(), 2);
+        assert_eq!(statement.projections[0].expr, "u.email || ''");
+        assert_eq!(
+            statement.projections[0].alias.as_deref(),
+            Some("email_expr")
+        );
+        assert_eq!(statement.projections[1].expr, ":id");
+        assert_eq!(
+            statement.projections[1].alias.as_deref(),
+            Some("requested_id")
+        );
+    }
+
+    #[test]
     fn ignores_params_in_quoted_text_and_comments_for_predicate_pairs() {
         let statement = parse_select(
             "SELECT id FROM users WHERE note = ':ignored' AND id = :id -- email = :comment\n/* parent_id = :block */",
@@ -1077,12 +1846,14 @@ mod tests {
                     name: "users".to_string(),
                     alias: Some("u".to_string()),
                     derived_query: None,
+                    lateral: false,
                     nullable: false
                 },
                 TableReference {
                     name: "organizations".to_string(),
                     alias: Some("o".to_string()),
                     derived_query: None,
+                    lateral: false,
                     nullable: true
                 }
             ]
@@ -1117,12 +1888,14 @@ mod tests {
                     name: "users".to_string(),
                     alias: Some("u".to_string()),
                     derived_query: None,
+                    lateral: false,
                     nullable: true
                 },
                 TableReference {
                     name: "organizations".to_string(),
                     alias: Some("o".to_string()),
                     derived_query: None,
+                    lateral: false,
                     nullable: false
                 }
             ]
@@ -1133,6 +1906,210 @@ mod tests {
         )
         .unwrap();
         assert!(full.table_refs.iter().all(|table| table.nullable));
+    }
+
+    #[test]
+    fn parses_parenthesized_join_groups() {
+        let statement = parse_select(
+            "SELECT u.id, o.name, a.slug
+             FROM users u
+             LEFT JOIN (organizations o JOIN accounts a ON a.org_id = o.id) ON o.id = u.org_id
+             WHERE u.id = :id",
+        )
+        .unwrap();
+
+        assert_eq!(
+            statement.table_refs,
+            vec![
+                TableReference {
+                    name: "users".to_string(),
+                    alias: Some("u".to_string()),
+                    derived_query: None,
+                    lateral: false,
+                    nullable: false
+                },
+                TableReference {
+                    name: "organizations".to_string(),
+                    alias: Some("o".to_string()),
+                    derived_query: None,
+                    lateral: false,
+                    nullable: true
+                },
+                TableReference {
+                    name: "accounts".to_string(),
+                    alias: Some("a".to_string()),
+                    derived_query: None,
+                    lateral: false,
+                    nullable: true
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_lateral_derived_tables_inside_parenthesized_join_groups() {
+        let statement = parse_select(
+            "SELECT u.id, org_meta.org_expr
+             FROM users u
+             LEFT JOIN (
+                organizations o
+                JOIN LATERAL (SELECT o.name || '' AS org_expr) org_meta ON true
+             ) ON o.id = u.org_id
+             WHERE u.id = :id",
+        )
+        .unwrap();
+
+        assert_eq!(statement.table_refs.len(), 3);
+        assert_eq!(statement.table_refs[0].name, "users");
+        assert!(!statement.table_refs[0].nullable);
+        assert!(!statement.table_refs[0].lateral);
+        assert_eq!(statement.table_refs[1].name, "organizations");
+        assert_eq!(statement.table_refs[1].alias.as_deref(), Some("o"));
+        assert!(statement.table_refs[1].nullable);
+        assert!(!statement.table_refs[1].lateral);
+        assert_eq!(statement.table_refs[2].name, "org_meta");
+        assert_eq!(statement.table_refs[2].alias.as_deref(), Some("org_meta"));
+        assert_eq!(
+            statement.table_refs[2].derived_query.as_deref(),
+            Some("SELECT o.name || '' AS org_expr")
+        );
+        assert!(statement.table_refs[2].nullable);
+        assert!(statement.table_refs[2].lateral);
+    }
+
+    #[test]
+    fn sqlparser_ast_lowerer_handles_quoted_lateral_join_shapes() {
+        let statement = parse_select_with_sqlparser(
+            r#"
+            SELECT "u"."id" AS user_id, e.email_expr
+            FROM "users" AS "u"
+            LEFT JOIN LATERAL (
+                SELECT "u"."email" || '' AS email_expr
+            ) AS e ON true
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(statement.table, "users");
+        assert_eq!(statement.projections.len(), 2);
+        assert_eq!(statement.projections[0].alias.as_deref(), Some("user_id"));
+        assert_eq!(
+            statement.table_refs,
+            vec![
+                TableReference {
+                    name: "users".to_string(),
+                    alias: Some("u".to_string()),
+                    derived_query: None,
+                    lateral: false,
+                    nullable: false
+                },
+                TableReference {
+                    name: "e".to_string(),
+                    alias: Some("e".to_string()),
+                    derived_query: Some("SELECT \"u\".\"email\" || '' AS email_expr".to_string()),
+                    lateral: true,
+                    nullable: true
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlparser_ast_lowerer_extracts_named_equality_params() {
+        let statement = parse_select_with_sqlparser(
+            "
+            WITH filtered AS (
+                SELECT id FROM users WHERE email = :cte_email
+            )
+            SELECT u.id
+            FROM users u
+            LEFT JOIN LATERAL (
+                SELECT e.email
+                FROM emails e
+                WHERE e.user_id = u.id AND e.kind = :kind
+            ) recent ON true
+            JOIN organizations o ON o.id = u.org_id AND o.slug = :org_slug
+            WHERE u.id = :id AND :parent_id = u.parent_id AND ':ignored' = u.note
+            ",
+        )
+        .unwrap();
+
+        assert_eq!(
+            statement.equality_params,
+            vec![
+                EqualityParam {
+                    qualifier: None,
+                    column: "email".to_string(),
+                    param: "cte_email".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("e".to_string()),
+                    column: "kind".to_string(),
+                    param: "kind".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("o".to_string()),
+                    column: "slug".to_string(),
+                    param: "org_slug".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "id".to_string(),
+                    param: "id".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "parent_id".to_string(),
+                    param: "parent_id".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_comma_separated_table_references() {
+        let statement = parse_select(
+            "SELECT u.id, o.name
+             FROM users u, organizations o
+             WHERE u.org_id = o.id AND u.id = :id",
+        )
+        .unwrap();
+
+        assert_eq!(
+            statement.table_refs,
+            vec![
+                TableReference {
+                    name: "users".to_string(),
+                    alias: Some("u".to_string()),
+                    derived_query: None,
+                    lateral: false,
+                    nullable: false
+                },
+                TableReference {
+                    name: "organizations".to_string(),
+                    alias: Some("o".to_string()),
+                    derived_query: None,
+                    lateral: false,
+                    nullable: false
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn nullable_parenthesized_groups_apply_to_comma_table_references() {
+        let statement = parse_select(
+            "SELECT u.id, o.name, a.slug
+             FROM users u
+             LEFT JOIN (organizations o, accounts a) ON o.id = u.org_id AND a.org_id = o.id
+             WHERE u.id = :id",
+        )
+        .unwrap();
+
+        assert_eq!(statement.table_refs.len(), 3);
+        assert!(!statement.table_refs[0].nullable);
+        assert!(statement.table_refs[1].nullable);
+        assert!(statement.table_refs[2].nullable);
     }
 
     #[test]
@@ -1149,7 +2126,9 @@ mod tests {
             statement.ctes,
             vec![CommonTableExpression {
                 name: "filtered_users".to_string(),
+                columns: Vec::new(),
                 query: "SELECT id, email FROM users WHERE active = true".to_string(),
+                recursive: false,
             }]
         );
         assert_eq!(statement.table, "filtered_users");
@@ -1161,6 +2140,28 @@ mod tests {
                 param: "id".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn parses_recursive_cte_prefix_into_ir() {
+        let statement = parse_select(
+            "WITH RECURSIVE tree(node_id, parent_node_id) AS (
+                SELECT id, parent_id FROM nodes WHERE id = :root_id
+                UNION ALL
+                SELECT n.id, n.parent_id FROM nodes n JOIN tree t ON n.parent_id = t.id
+            )
+            SELECT tree.node_id FROM tree",
+        )
+        .unwrap();
+
+        assert_eq!(statement.ctes.len(), 1);
+        assert_eq!(statement.ctes[0].name, "tree");
+        assert_eq!(
+            statement.ctes[0].columns,
+            vec!["node_id".to_string(), "parent_node_id".to_string()]
+        );
+        assert!(statement.ctes[0].recursive);
+        assert_eq!(statement.table, "tree");
     }
 
     #[test]
@@ -1189,6 +2190,53 @@ mod tests {
             Some("SELECT id, name FROM organizations")
         );
         assert!(statement.table_refs[1].nullable);
+    }
+
+    #[test]
+    fn parses_lateral_derived_table_references() {
+        let statement = parse_select(
+            "SELECT u.id, recent.email
+             FROM users u
+             LEFT JOIN LATERAL (
+                SELECT e.email
+                FROM emails e
+                WHERE e.user_id = u.id AND e.kind = :kind
+                ORDER BY e.created_at DESC
+                LIMIT 1
+             ) AS recent ON true
+             WHERE u.id = :id",
+        )
+        .unwrap();
+
+        assert_eq!(statement.table, "users");
+        assert_eq!(statement.table_refs.len(), 2);
+        assert_eq!(statement.table_refs[0].name, "users");
+        assert!(!statement.table_refs[0].lateral);
+        assert_eq!(statement.table_refs[1].name, "recent");
+        assert_eq!(statement.table_refs[1].alias.as_deref(), Some("recent"));
+        assert!(statement.table_refs[1].lateral);
+        assert!(statement.table_refs[1].nullable);
+        assert_eq!(
+            statement.table_refs[1].derived_query.as_deref(),
+            Some(
+                "SELECT e.email FROM emails e WHERE e.user_id = u.id AND e.kind = :kind ORDER BY e.created_at DESC LIMIT 1"
+            )
+        );
+        assert_eq!(
+            statement.equality_params,
+            vec![
+                EqualityParam {
+                    qualifier: Some("e".to_string()),
+                    column: "kind".to_string(),
+                    param: "kind".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "id".to_string(),
+                    param: "id".to_string()
+                }
+            ]
+        );
     }
 
     #[test]

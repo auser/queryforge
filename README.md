@@ -21,6 +21,26 @@ cargo run -p queryforge-cli -- generate queryforge.toml
 
 This writes generated modules into `src/db` by default.
 
+SQL blocks use Cornucopia-style names. Cardinality is optional: `SELECT`/`WITH` defaults to `many`, while mutation and DDL statements default to `exec`.
+
+```sql
+--! insert_author
+INSERT INTO authors (first_name, last_name, country)
+VALUES (:first_name, :last_name, :country);
+
+--! authors
+SELECT first_name, last_name, country FROM authors;
+```
+
+Use an explicit cardinality only when the default is not the shape you want, such as `INSERT ... RETURNING ...`:
+
+```sql
+--! insert_author : one
+INSERT INTO authors (first_name, last_name, country)
+VALUES (:first_name, :last_name, :country)
+RETURNING id, first_name, last_name, country;
+```
+
 ## Examples
 
 Run commands from the workspace root unless an example README says otherwise.
@@ -41,10 +61,11 @@ cargo run -p queryforge-cli -- prepare examples/basic/queryforge.toml
 Library crate showing the smallest `build.rs` integration.
 
 ```bash
+cargo run -p queryforge-build-rs-example
 cargo check -p queryforge-build-rs-example
 ```
 
-The build script calls `queryforge-build`, emits Cargo rebuild hints, and includes generated code from `OUT_DIR/queryforge`.
+The build script calls `queryforge-build`, emits Cargo rebuild hints, includes generated code from `OUT_DIR/queryforge`, and the binary executes generated native libSQL functions against an in-memory database.
 
 ### `examples/usage-app`
 
@@ -55,7 +76,72 @@ cargo run -p queryforge-usage-app
 cargo test -p queryforge-usage-app
 ```
 
-The test creates an in-memory libSQL database and exercises generated functions with both a connection and a transaction.
+The binary creates an in-memory libSQL database and calls generated functions. The test also exercises generated functions with both a connection and a transaction.
+
+### `examples/crud`
+
+Binary crate showing SQL-first CRUD-style mutations without `: exec` annotations.
+
+```bash
+cargo run -p queryforge-crud-example
+cargo test -p queryforge-crud-example
+```
+
+The binary and test create an in-memory libSQL database and exercise generated create, read, update, upsert, list, and delete functions.
+
+### `examples/sqlite-e2e`
+
+Runnable SQLx SQLite e2e example. It generates SQLx SQLite functions in `build.rs`, creates an in-memory SQLite database at runtime, and executes generated functions against a pool and a transaction.
+
+```bash
+cargo run -p queryforge-sqlite-e2e-example
+cargo test -p queryforge-sqlite-e2e-example
+```
+
+This is the quickest example for seeing SQLx-backed generated code actually execute without Docker.
+
+### `examples/postgres-e2e`
+
+Runnable SQLx Postgres e2e example. It is not a workspace member because its build script connects to Postgres for live prepared-statement introspection.
+
+Start Postgres:
+
+```bash
+docker run --rm --name queryforge-postgres-e2e-example \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=queryforge \
+  -p 127.0.0.1:55432:5432 \
+  postgres:16-alpine
+```
+
+Then run the example from another terminal:
+
+```bash
+cargo run --manifest-path examples/postgres-e2e/Cargo.toml
+```
+
+The build script creates the schema, QueryForge introspects it through `tokio-postgres`, and the binary executes generated SQLx Postgres functions against a pool and transaction.
+
+### `examples/type-mapping-profiles`
+
+Compile fixture for external generated type mappings.
+
+```bash
+cargo check -p queryforge-type-mapping-profiles-example
+cargo test -p queryforge-type-mapping-profiles-example
+```
+
+The build script writes generated modules for SQLx Postgres, tokio-postgres, and native libSQL into `OUT_DIR`, then the crate compiles those modules with real application dependencies such as `uuid`, `serde_json`, `time`, `chrono`, and `rust_decimal`.
+
+### `examples/live-libsql-catalog`
+
+Binary crate showing live local libSQL/SQLite catalog introspection. Its `build.rs` creates `catalog.db`, then QueryForge reads table metadata from `sqlite_schema` and `PRAGMA table_xinfo` instead of `[schema].files`.
+
+```bash
+cargo run -p queryforge-live-libsql-catalog-example
+```
+
+This example requires the generator-side `libsql-runtime` feature through `queryforge-build`.
 
 ### `examples/with-config`
 
@@ -66,7 +152,7 @@ cargo run -p queryforge-with-config-example
 cargo test -p queryforge-with-config-example
 ```
 
-It prints generated SQL constants and the generated project fingerprint.
+It prints generated SQL constants, creates an in-memory libSQL database, inserts a row, and reads it back.
 
 ## build.rs API
 
@@ -74,6 +160,28 @@ It prints generated SQL constants and the generated project fingerprint.
 fn main() {
     queryforge_build::generate()
         .config("queryforge.toml")
+        .watch("queries")
+        .watch("schema.sql")
+        .run()
+        .expect("queryforge generation failed");
+}
+```
+
+By default, `queryforge-build` writes to `OUT_DIR/queryforge`, which keeps generated files out of source control and works with:
+
+```rust
+pub mod db {
+    include!(concat!(env!("OUT_DIR"), "/queryforge/mod.rs"));
+}
+```
+
+Use `.output_dir(...)` when a build script should write somewhere else:
+
+```rust
+fn main() {
+    queryforge_build::generate()
+        .config("queryforge.toml")
+        .output_dir("src/db")
         .watch("queries")
         .watch("schema.sql")
         .run()
@@ -146,9 +254,9 @@ The default `queryforge` crate stays dependency-light and does not compile datab
 - `libsql` is reserved for the dependency-light libSQL/SQLite schema-driven generation path.
 - `libsql-runtime` enables adapters for upstream `libsql::Connection` and `libsql::Transaction`.
 - `queryforge-cli` and `queryforge-build` forward these features; enable `postgres` there only when a CLI/build script needs live Postgres introspection.
-- External generated type paths are feature-gated without adding dependencies to QueryForge: `uuid-types`, `chrono-types`, `time-types`, `serde-json-types`, and `decimal-types`.
+- External generated type paths and native libSQL runtime adapters are feature-gated: `uuid-types`, `chrono-types`, `time-types`, `serde-json-types`, and `decimal-types`.
 
-When an external mapping is enabled in `queryforge.toml`, enable the matching QueryForge feature on the generator and add the actual external crate to the application that compiles the generated code:
+When an external mapping is enabled in `queryforge.toml`, enable the matching QueryForge feature on the generator and add the actual external crate to the application that compiles the generated code. QueryForge still keeps these dependencies out of the default build.
 
 ```toml
 [type_mapping]
@@ -173,11 +281,11 @@ rust_decimal = "1"
 
 QueryForge parses named SQL blocks, loads nested TOML config, normalizes named parameters, computes fingerprints, writes initial offline metadata with `queryforge prepare`, and generates Rust modules.
 
-The parser boundary is intentionally narrow: `nom` parses QueryForge block headers and the supported SQL-shape subset into a shared lightweight `sql_ir`. QueryForge does not try to be a full SQL parser.
+The parser boundary is intentionally narrow: `nom` parses QueryForge block headers, while `sqlparser-rs` provides AST-backed lowering for supported PostgreSQL/SQLite `SELECT` shapes into the shared lightweight `sql_ir`, including structural extraction of named equality params. QueryForge keeps a compatibility fallback for SQL shapes not yet lowered from the AST, and it still relies on database metadata for final type inference rather than trying to become a full SQL engine.
 
-Postgres inspection uses `tokio-postgres` prepared statement metadata for parameter and column types. Direct table-column nullability is inferred from `pg_attribute`; conservative expression nullability handles direct columns, common expressions, outer joins, simple CTEs, and derived-table subqueries.
+Postgres inspection uses `tokio-postgres` prepared statement metadata for parameter and column types. Direct table-column nullability is inferred from `pg_attribute`; conservative expression nullability handles direct columns, bind params, common expressions such as `CASE`, `nullif`, comparisons, arithmetic and boolean expressions, `BETWEEN`, `IN`/`NOT IN`, `LIKE`/`ILIKE`, outer joins, nullable parenthesized join groups, comma/CROSS-style table references, simple CTEs, declared recursive CTE result columns, recursive CTE branch nullability merging, derived-table subqueries, and lateral derived tables that depend on preceding outer relations, including lateral derived tables inside parenthesized join groups.
 
-libSQL inspection currently consumes `sql_ir` plus configured schema SQL files for dependency-free inference. It handles direct columns, joins, simple CTEs and derived tables, compound select branch parameter types, `*`, simple equality parameter types, and basic expressions such as `count(*)`, `lower(...)`, and `upper(...)`.
+libSQL inspection currently consumes `sql_ir` plus configured schema SQL files for dependency-free inference. With `libsql-runtime`, it can also inspect a local database catalog through `sqlite_schema`, `PRAGMA table_xinfo`, indexes, and foreign keys. It handles direct columns, joins, simple CTEs, declared CTE column lists, derived tables, lateral derived-table joins, compound select branch parameter types, `*`, simple equality parameter types, and basic expressions such as `count(*)`, `lower(...)`, `upper(...)`, `coalesce(...)`, and `||` string concatenation.
 
 SQLx Postgres and SQLx SQLite renderers emit executor-style async functions that can be called with pools, connections, or transactions. The tokio-postgres renderer emits `GenericClient`-based async functions for clients and transactions. Native libSQL rendering calls the QueryForge runtime executor trait and has concrete adapters for the upstream `libsql` crate.
 

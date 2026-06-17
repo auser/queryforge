@@ -1,11 +1,13 @@
 [package]
-name = "queryforge-usage-app"
+name = "queryforge-live-libsql-catalog-example"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [build-dependencies]
-queryforge-build = { path = "../../crates/queryforge-build" }
+libsql = { version = "0.10.0-pre.4", default-features = false, features = ["core"] }
+queryforge-build = { path = "../../crates/queryforge-build", features = ["libsql-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [dependencies]
 libsql = { version = "0.10.0-pre.4", default-features = false, features = ["core"] }

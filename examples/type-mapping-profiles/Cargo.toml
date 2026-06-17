@@ -1,0 +1,18 @@
+[package]
+name = "queryforge-type-mapping-profiles-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+queryforge = { path = "../..", features = ["uuid-types", "serde-json-types", "time-types", "chrono-types", "decimal-types"] }
+
+[dependencies]
+chrono = "0.4"
+queryforge = { path = "../..", features = ["libsql-runtime", "uuid-types", "serde-json-types", "time-types", "chrono-types", "decimal-types"] }
+rust_decimal = "1"
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "uuid", "json", "time", "chrono", "rust_decimal"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"] }
+uuid = "1"

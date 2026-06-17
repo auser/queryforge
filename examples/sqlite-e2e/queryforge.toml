@@ -1,0 +1,26 @@
+[database]
+backend = "libsql"
+url = "file:sqlite-e2e.db"
+
+[codegen]
+out_dir = "src/db"
+execution_target = "sqlx-sqlite"
+query_dir = "queries"
+
+[schema]
+files = ["schema.sql"]
+
+[migrations]
+paths = []
+
+[build]
+default_output = "out-dir"
+offline = "auto"
+watch = [
+  "queryforge.toml",
+  "schema.sql",
+  "queries",
+]
+
+[inference]
+unknown_expression_policy = "error"

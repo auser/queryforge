@@ -3,8 +3,45 @@ pub mod db {
 }
 
 fn main() {
-    println!("{}", db::queryforge_metadata::QUERYFORGE_FINGERPRINT);
-    println!("{}", db::users::GET_USER_SQL);
+    println!(
+        "fingerprint: {}",
+        db::queryforge_metadata::QUERYFORGE_FINGERPRINT
+    );
+    println!("get_user:\n{}", db::users::GET_USER_SQL);
+    println!("list_users:\n{}", db::users::LIST_USERS_SQL);
+
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async { run().await });
+}
+
+async fn run() {
+    let database = libsql::Builder::new_local(":memory:")
+        .build()
+        .await
+        .unwrap();
+    let conn = database.connect().unwrap();
+
+    libsql::Connection::execute(
+        &conn,
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL)",
+        (),
+    )
+    .await
+    .unwrap();
+    libsql::Connection::execute(
+        &conn,
+        "INSERT INTO users (id, email) VALUES (?1, ?2)",
+        (1_i64, "a@example.com"),
+    )
+    .await
+    .unwrap();
+
+    let user = db::users::get_user(&conn, 1).await.unwrap();
+    println!("user: {}", user.email);
+
+    let users = db::users::list_users(&conn).await.unwrap();
+    println!("users: {}", users.len());
 }
 
 #[cfg(test)]
