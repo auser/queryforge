@@ -1,0 +1,28 @@
+[database]
+backend = "libsql"
+url = "file:usage-app.db"
+
+[codegen]
+# For normal CLI generation this can be src/db.
+# queryforge-build may override this to OUT_DIR depending on your helper implementation.
+out_dir = "src/db"
+execution_target = "libsql-native"
+query_dir = "queries"
+
+[schema]
+files = ["schema.sql"]
+
+[migrations]
+paths = []
+
+[build]
+default_output = "out-dir"
+offline = "auto"
+watch = [
+  "queryforge.toml",
+  "schema.sql",
+  "queries"
+]
+
+[inference]
+unknown_expression_policy = "error"

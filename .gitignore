@@ -1,0 +1,5 @@
+/target
+/src/db
+.queryforge/metadata.json
+.queryforge/
+*.db

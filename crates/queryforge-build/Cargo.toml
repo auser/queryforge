@@ -1,0 +1,20 @@
+[package]
+name = "queryforge-build"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+postgres = ["queryforge/postgres"]
+libsql = ["queryforge/libsql"]
+sqlx-postgres = ["queryforge/sqlx-postgres"]
+sqlx-sqlite = ["queryforge/sqlx-sqlite"]
+uuid-types = ["queryforge/uuid-types"]
+chrono-types = ["queryforge/chrono-types"]
+time-types = ["queryforge/time-types"]
+serde-json-types = ["queryforge/serde-json-types"]
+decimal-types = ["queryforge/decimal-types"]
+
+[dependencies]
+queryforge = { path = "../..", default-features = false, features = ["build-api"] }

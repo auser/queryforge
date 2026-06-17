@@ -1,0 +1,47 @@
+[workspace]
+members = [
+    ".",
+    "crates/queryforge-cli",
+    "crates/queryforge-build",
+    "examples/build-rs",
+    "examples/usage-app",
+    "examples/with-config",
+]
+resolver = "2"
+
+[package]
+name = "queryforge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "SQL-first Rust code generation for Postgres and libSQL."
+
+[features]
+default = []
+postgres = ["dep:tokio", "dep:tokio-postgres"]
+libsql = []
+libsql-runtime = ["dep:libsql", "dep:tokio"]
+sqlx-postgres = []
+sqlx-sqlite = []
+build-api = []
+uuid-types = []
+chrono-types = []
+time-types = []
+serde-json-types = []
+decimal-types = []
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.1.2"
+nom = "8.0.0"
+prettyplease = "0.2"
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+libsql = { version = "0.10.0-pre.4", default-features = false, features = ["core"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio-postgres = "0.7"

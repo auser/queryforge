@@ -1,0 +1,26 @@
+[database]
+backend = "libsql"
+url = "file:example.db"
+
+[codegen]
+execution_target = "libsql-native"
+out_dir = "src/db"
+query_dir = "queries"
+
+[schema]
+files = ["schema.sql"]
+
+[migrations]
+paths = []
+
+[build]
+default_output = "out-dir"
+offline = "auto"
+watch = [
+  "queryforge.toml",
+  "schema.sql",
+  "queries"
+]
+
+[inference]
+unknown_expression_policy = "error"

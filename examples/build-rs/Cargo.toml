@@ -1,0 +1,10 @@
+[package]
+name = "queryforge-build-rs-example"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+queryforge-build = { path = "../../crates/queryforge-build" }
+
+[dependencies]
+queryforge = { path = "../.." }

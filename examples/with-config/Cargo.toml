@@ -1,0 +1,13 @@
+[package]
+name = "queryforge-with-config-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# This assumes you copy this example into queryforge/examples/usage-app.
+# From there, ../.. points at the top-level queryforge crate.
+queryforge = { path = "../.." }
+
+[build-dependencies]
+queryforge-build = { path = "../../crates/queryforge-build" }
