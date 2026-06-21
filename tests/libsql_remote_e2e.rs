@@ -60,6 +60,7 @@ fn remote_libsql_live_catalog_e2e() {
             "SELECT id, email, parent_id, active FROM {table_name} WHERE id = :id"
         ),
         cardinality: Cardinality::One,
+        type_overrides: Default::default(),
     }];
 
     let project = queryforge::backends::libsql::inspect(&config, parsed).unwrap();

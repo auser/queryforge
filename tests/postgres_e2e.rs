@@ -53,6 +53,7 @@ fn postgres_prepared_statement_metadata_e2e() {
                 "SELECT u.id, u.parent_id, u.email, u.active, o.name AS org_name, u.email || '' AS email_expr FROM users u LEFT JOIN organizations o ON o.id = u.org_id WHERE u.id = :id OR u.parent_id = :id"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         },
         ParsedQuery {
             name: "get_active_user".to_string(),
@@ -61,6 +62,7 @@ fn postgres_prepared_statement_metadata_e2e() {
                 "WITH active_users AS (SELECT id, email, parent_id FROM users WHERE active = true) SELECT au.id, au.email, au.parent_id, au.email || '' AS email_expr FROM active_users au WHERE au.id = :id"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         },
         ParsedQuery {
             name: "get_user_expressions".to_string(),
@@ -69,6 +71,7 @@ fn postgres_prepared_statement_metadata_e2e() {
                 "SELECT CASE WHEN active THEN email ELSE 'inactive@example.com' END AS display_email, CASE WHEN parent_id IS NULL THEN email END AS maybe_email, NULLIF(email, '') AS nullified_email, active AND email <> '' AS valid_user, parent_id = :parent_id AS parent_matches, id BETWEEN :min_id AND :max_id AS id_between, email LIKE '%@example.com' AS email_like, parent_id IN (1, 2) AS parent_in, parent_id + 1 AS parent_plus_one FROM users WHERE id = :id"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         },
         ParsedQuery {
             name: "walk_nodes".to_string(),
@@ -77,6 +80,7 @@ fn postgres_prepared_statement_metadata_e2e() {
                 "WITH RECURSIVE tree(node_id, parent_node_id, node_label) AS (SELECT id, parent_id, label FROM nodes WHERE id = :root_id UNION ALL SELECT n.id, n.parent_id, n.label FROM nodes n JOIN tree t ON n.parent_id = t.node_id) SELECT tree.node_id, tree.parent_node_id, tree.node_label, tree.node_label || '' AS label_expr FROM tree"
                     .to_string(),
             cardinality: Cardinality::Many,
+            type_overrides: Default::default(),
         },
         ParsedQuery {
             name: "walk_nodes_recursive_branch_nullable".to_string(),
@@ -85,6 +89,7 @@ fn postgres_prepared_statement_metadata_e2e() {
                 "WITH RECURSIVE nullable_tree(node_id, maybe_parent_id) AS (SELECT id, id FROM nodes WHERE id = :root_id UNION ALL SELECT n.id, n.parent_id FROM nodes n JOIN nullable_tree t ON n.parent_id = t.node_id) SELECT nullable_tree.node_id, nullable_tree.maybe_parent_id FROM nullable_tree"
                     .to_string(),
             cardinality: Cardinality::Many,
+            type_overrides: Default::default(),
         },
         ParsedQuery {
             name: "get_user_lateral".to_string(),
@@ -93,6 +98,7 @@ fn postgres_prepared_statement_metadata_e2e() {
                 "SELECT u.id, lateral_user.email_expr, lateral_user.parent_expr FROM users u JOIN LATERAL (SELECT u.email || '' AS email_expr, u.parent_id || '' AS parent_expr) lateral_user ON true WHERE u.id = :id"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         },
         ParsedQuery {
             name: "get_user_join_group".to_string(),
@@ -101,6 +107,7 @@ fn postgres_prepared_statement_metadata_e2e() {
                 "SELECT u.id, o.name AS org_name, a.slug AS account_slug FROM users u LEFT JOIN (organizations o JOIN accounts a ON a.org_id = o.id) ON o.id = u.org_id WHERE u.id = :id"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         },
         ParsedQuery {
             name: "get_user_comma_join".to_string(),
@@ -109,6 +116,7 @@ fn postgres_prepared_statement_metadata_e2e() {
                 "SELECT u.id, o.name || '' AS org_expr FROM users u, organizations o WHERE u.org_id = o.id AND u.id = :id"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         },
         ParsedQuery {
             name: "get_user_lateral_group".to_string(),
@@ -117,6 +125,7 @@ fn postgres_prepared_statement_metadata_e2e() {
                 "SELECT u.id, org_meta.org_expr FROM users u LEFT JOIN (organizations o JOIN LATERAL (SELECT o.name || '' AS org_expr) org_meta ON true) ON o.id = u.org_id WHERE u.id = :id"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         },
     ];
 

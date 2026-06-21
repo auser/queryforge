@@ -100,12 +100,95 @@ pub struct QueryDependencies {
     pub functions: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeOverrideTarget {
+    Any,
+    Param,
+    Column,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeOverride {
+    pub target: TypeOverrideTarget,
+    pub name: String,
+    pub rust_type: RustType,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TypeOverrides {
+    pub entries: Vec<TypeOverride>,
+}
+
+impl TypeOverrides {
+    pub fn for_param(&self, name: &str) -> Option<&RustType> {
+        self.entries.iter().rev().find_map(|entry| {
+            if matches!(
+                entry.target,
+                TypeOverrideTarget::Any | TypeOverrideTarget::Param
+            ) && entry.name == name
+            {
+                Some(&entry.rust_type)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn for_column(&self, name: &str, rust_name: &str) -> Option<&RustType> {
+        self.entries.iter().rev().find_map(|entry| {
+            if matches!(
+                entry.target,
+                TypeOverrideTarget::Any | TypeOverrideTarget::Column
+            ) && (entry.name == name || entry.name == rust_name)
+            {
+                Some(&entry.rust_type)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn validate_matches(
+        &self,
+        query_name: &str,
+        params: &[QueryParam],
+        columns: &[QueryColumn],
+    ) -> Result<()> {
+        for entry in &self.entries {
+            let matches_param = params.iter().any(|param| param.name == entry.name);
+            let matches_column = columns
+                .iter()
+                .any(|column| column.name == entry.name || column.rust_name == entry.name);
+            let matched = match entry.target {
+                TypeOverrideTarget::Any => matches_param || matches_column,
+                TypeOverrideTarget::Param => matches_param,
+                TypeOverrideTarget::Column => matches_column,
+            };
+
+            if !matched {
+                let target = match entry.target {
+                    TypeOverrideTarget::Any => "param or column",
+                    TypeOverrideTarget::Param => "param",
+                    TypeOverrideTarget::Column => "column",
+                };
+                return Err(Error::Parse(format!(
+                    "type override `{}` for query `{query_name}` did not match any generated {target}",
+                    entry.name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedQuery {
     pub name: String,
     pub source_file: PathBuf,
     pub original_sql: String,
     pub cardinality: Cardinality,
+    pub type_overrides: TypeOverrides,
 }
 
 #[derive(Debug, Clone)]

@@ -23,7 +23,7 @@ cargo run -p queryforge-cli -- generate queryforge.toml
 
 This writes generated modules into `src/db` by default.
 
-SQL blocks use Cornucopia-style names. Cardinality is optional: `SELECT`/`WITH` defaults to `many`, while mutation and DDL statements default to `exec`.
+SQL blocks use Cornucopia-style names. Cardinality is optional: `SELECT`/`WITH` defaults to `many`, plain mutation and DDL statements default to `exec`, single-row `INSERT ... RETURNING` defaults to `one`, and `UPDATE`/`DELETE ... RETURNING` defaults to `many`.
 
 ```sql
 --! insert_author
@@ -54,7 +54,31 @@ for author in authors {
 }
 ```
 
-Use an explicit cardinality only when the default is not the shape you want, such as `INSERT ... RETURNING ...`:
+Use `INSERT ... RETURNING ...` without `: one` when inserting one row and returning it:
+
+```sql
+--! insert_author
+INSERT INTO authors (first_name, last_name, country)
+VALUES (:first_name, :last_name, :country)
+RETURNING id, first_name, last_name, country;
+```
+
+```rust
+let author = db::authors::insert_author(
+    &conn,
+    db::authors::InsertAuthorParams {
+        first_name: "Octavia".to_string(),
+        last_name: "Butler".to_string(),
+        country: "US".to_string(),
+    },
+)
+.await?;
+println!("inserted author #{}", author.id);
+```
+
+Use an explicit cardinality only when the default is not the shape you want, such as `optional` for an update that should affect at most one row or `many` for a bulk insert with `RETURNING`.
+
+Explicit cardinality is still supported when you prefer to document the contract in the SQL block header:
 
 ```sql
 --! insert_author : one
@@ -62,6 +86,17 @@ INSERT INTO authors (first_name, last_name, country)
 VALUES (:first_name, :last_name, :country)
 RETURNING id, first_name, last_name, country;
 ```
+
+QueryForge also supports per-query Rust type overrides with `--:` directives when database metadata is not specific enough or when application code has a newtype:
+
+```sql
+--! get_author
+--: param.id: AuthorId
+--: column.email: EmailAddress
+SELECT id, email FROM authors WHERE id = :id;
+```
+
+Use `param.name` for generated params, `column.name` for returned row fields, or an unscoped `name` to apply to both matching params and columns. Column overrides replace the base Rust type; normal nullability wrapping still applies.
 
 ## Examples
 
@@ -236,6 +271,101 @@ let user = db::users::get_user(
 
 This makes call sites easier to read, gives IDEs concrete field names to autocomplete, and prevents same-type positional argument swaps.
 
+When needed, per-query `--:` overrides can give those generated DTO fields application-specific Rust types:
+
+```sql
+--! get_user
+--: param.id: UserId
+--: column.email: Email
+SELECT id, email FROM users WHERE id = :id;
+```
+
+The generated `GetUserParams` will contain `pub id: UserId`, and `GetUserRow` will contain `pub email: Email` unless that column is nullable, in which case the generated field becomes `Option<Email>`.
+
+Use scoped overrides when a parameter and returned column share a name but need different Rust types:
+
+```sql
+--! find_author
+--: param.id: AuthorId
+--: column.id: i64
+SELECT id, name
+FROM authors
+WHERE id = :id;
+```
+
+Use an unscoped override when the same Rust type should apply to both a matching param and matching column:
+
+```sql
+--! get_author
+--: id: AuthorId
+SELECT id, name
+FROM authors
+WHERE id = :id;
+```
+
+Overrides are validated against the generated shape. If `--: column.emali: Email` does not match a returned column or generated Rust field name, generation fails instead of silently ignoring the typo.
+
+QueryForge-owned scalar traits let application newtypes stay backend-neutral. Generated code calls `QueryForgeEncode` for params and `QueryForgeDecode` for returned columns, then uses the associated `Storage` type with the selected database driver.
+
+```rust
+#[derive(Debug, Clone, Copy)]
+pub struct AuthorId(pub i64);
+queryforge::scalar_newtype!(AuthorId, i64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailAddress(pub String);
+queryforge::scalar_newtype!(EmailAddress, String);
+```
+
+The macro is shorthand for implementing both directions once:
+
+```rust
+impl queryforge::QueryForgeEncode for AuthorId {
+    type Storage = i64;
+
+    fn queryforge_encode(self) -> i64 {
+        self.0
+    }
+}
+
+impl queryforge::QueryForgeDecode for AuthorId {
+    type Storage = i64;
+
+    fn queryforge_decode(value: i64) -> queryforge::Result<Self> {
+        Ok(Self(value))
+    }
+}
+```
+
+With those impls available, the same SQL override works for supported execution targets:
+
+```rust
+let author = db::authors::get_author(
+    &pool,
+    db::authors::GetAuthorParams {
+        id: AuthorId(42),
+    },
+)
+.await?;
+
+let email: EmailAddress = author.email;
+```
+
+The associated `Storage` type is what must be supported by the active driver. For example, `AuthorId` stores as `i64`, so SQLx, tokio-postgres, and native libSQL bind/decode `i64`; `EmailAddress` stores as `String`, so the drivers bind/decode `String`. If the storage type is not supported by the selected backend, Rust compilation fails in generated code.
+
+Use manual trait impls instead of `scalar_newtype!` when decoding can fail or validation belongs at the database boundary:
+
+```rust
+impl queryforge::QueryForgeDecode for EmailAddress {
+    type Storage = String;
+
+    fn queryforge_decode(value: String) -> queryforge::Result<Self> {
+        EmailAddress::parse(value)
+            .map_err(|err| queryforge::Error::Backend(format!("invalid email: {err}")))
+    }
+}
+```
+
 Generated rows are API boundary types, not ORM models: they do not own persistence behavior, relations, validation, or business methods.
 
 Query names drive generated API names: `--! get_user_with_org : one` generates a `get_user_with_org(...)` function, `GetUserWithOrgParams` when params exist, and `GetUserWithOrgRow` row type in the module derived from the SQL file name. Join queries can select duplicate column names; QueryForge keeps generated Rust valid by suffixing duplicate field identifiers (`id`, `id_2`, etc.) and decoding rows by column position. Prefer explicit SQL aliases such as `u.id AS user_id` and `o.id AS org_id` when you want stable semantic field names.
@@ -332,7 +462,7 @@ rust_decimal = "1"
 
 ## Current implementation level
 
-QueryForge parses named SQL blocks, loads nested TOML config, normalizes named parameters, computes fingerprints, writes initial offline metadata with `queryforge prepare`, and generates Rust modules.
+QueryForge parses named SQL blocks, infers default cardinality for common statement shapes including `INSERT ... RETURNING`, loads nested TOML config, normalizes named parameters, applies per-query Rust type overrides, computes fingerprints, writes initial offline metadata with `queryforge prepare`, and generates Rust modules.
 
 The parser boundary is intentional: `nom` parses QueryForge block headers, while `sqlparser-rs` provides AST-backed lowering for supported PostgreSQL/SQLite `CREATE TABLE`, `SELECT`, and mutation shapes into the shared lightweight `sql_ir`. QueryForge has an internal AST visitor over nested query, table, join, function, and expression paths so inference rules can inspect SQL structurally instead of reimplementing grammar. QueryForge keeps a compatibility fallback for SQL shapes not yet lowered from the AST, and it still relies on database metadata or conservative `Unknown` results rather than trying to become a full SQL engine.
 

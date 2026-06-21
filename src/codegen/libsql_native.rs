@@ -1,6 +1,7 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
+use crate::ir::Nullability;
 use crate::ir::{Cardinality, QueryShape};
 
 use super::{
@@ -102,7 +103,26 @@ fn render_row_struct(query: &QueryShape, row_name: &proc_macro2::Ident) -> Token
     let getters = columns.iter().map(|column| {
         let field = &column.field;
         let index = &column.index;
-        quote! { #field: row.try_get_index(#index)? }
+        if column.decode_override {
+            let base_ty = &column.base_ty;
+            match column.nullable {
+                Nullability::Nullable => quote! {
+                    #field: {
+                        let raw: Option<<#base_ty as queryforge::QueryForgeDecode>::Storage> = row.try_get_index(#index)?;
+                        raw.map(<#base_ty as queryforge::QueryForgeDecode>::queryforge_decode)
+                            .transpose()?
+                    }
+                },
+                Nullability::NonNull | Nullability::Unknown => quote! {
+                    #field: {
+                        let raw: <#base_ty as queryforge::QueryForgeDecode>::Storage = row.try_get_index(#index)?;
+                        <#base_ty as queryforge::QueryForgeDecode>::queryforge_decode(raw)?
+                    }
+                },
+            }
+        } else {
+            quote! { #field: row.try_get_index(#index)? }
+        }
     });
 
     quote! {
@@ -132,7 +152,15 @@ fn render_param_values(query: &QueryShape) -> TokenStream {
 
     let values = rendered_params(query).into_iter().map(|param| {
         let field = param.field;
-        quote! { queryforge::runtime::libsql_executor::LibsqlValue::from(params.#field) }
+        if param.encode_override {
+            quote! {
+                queryforge::runtime::libsql_executor::LibsqlValue::from(
+                    queryforge::QueryForgeEncode::queryforge_encode(params.#field)
+                )
+            }
+        } else {
+            quote! { queryforge::runtime::libsql_executor::LibsqlValue::from(params.#field) }
+        }
     });
     quote! {
         let query_params = vec![#( #values ),*];
@@ -180,6 +208,23 @@ mod tests {
 
         assert!(rendered.contains("queryforge::Result<u64>"));
         assert!(rendered.contains("executor.execute(GET_USER_SQL, &query_params).await"));
+    }
+
+    #[test]
+    fn renders_queryforge_scalar_overrides() {
+        let mut query = query(Cardinality::One);
+        query.params[0].rust_type = RustType::new("UserId");
+        query.params[0].source = TypeSource::UserOverride;
+        query.columns[0].rust_type = RustType::new("UserId");
+        query.columns[0].source = TypeSource::UserOverride;
+        let rendered = render_query(&query);
+
+        assert!(rendered.contains("pub id: UserId"));
+        assert!(rendered.contains("QueryForgeEncode"));
+        assert!(rendered.contains("queryforge_encode"));
+        assert!(rendered.contains("UserId as queryforge::QueryForgeDecode"));
+        assert!(rendered.contains("try_get_index(0)?"));
+        assert!(rendered.contains("queryforge_decode(raw)?"));
     }
 
     fn query(cardinality: Cardinality) -> QueryShape {

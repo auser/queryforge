@@ -82,7 +82,7 @@ async fn inspect_query(
         .await
         .map_err(|err| Error::Backend(format!("failed to prepare `{}`: {err}", query.name)))?;
 
-    let params = statement
+    let mut params: Vec<QueryParam> = statement
         .params()
         .iter()
         .enumerate()
@@ -99,6 +99,13 @@ async fn inspect_query(
             confidence: InferenceConfidence::Exact,
         })
         .collect();
+    for param in &mut params {
+        if let Some(rust_type) = query.type_overrides.for_param(&param.name) {
+            param.rust_type = rust_type.clone();
+            param.source = TypeSource::UserOverride;
+            param.confidence = InferenceConfidence::UserOverride;
+        }
+    }
 
     let parsed_select = sql_ir::parse_select(&query.original_sql);
     let nullable_join_tables = nullable_join_tables(parsed_select.as_ref());
@@ -135,6 +142,19 @@ async fn inspect_query(
             confidence: InferenceConfidence::Exact,
         });
     }
+    for column in &mut columns {
+        if let Some(rust_type) = query
+            .type_overrides
+            .for_column(&column.name, &column.rust_name)
+        {
+            column.rust_type = rust_type.clone();
+            column.source = TypeSource::UserOverride;
+            column.confidence = InferenceConfidence::UserOverride;
+        }
+    }
+    query
+        .type_overrides
+        .validate_matches(&query.name, &params, &columns)?;
 
     let fingerprint_input = format!(
         "queryforge-version={}\nbackend={}\nexecution-target={}\ninference-policy={}\ntype-mapping={}\nschema={}\nmigrations={}\nquery={}\ncardinality={:?}\nsql={}\nparams={:?}\ncolumns={:?}\n",

@@ -2,6 +2,14 @@ pub mod db {
     include!(concat!(env!("OUT_DIR"), "/queryforge/mod.rs"));
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserId(pub i64);
+queryforge::scalar_newtype!(UserId, i64);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailAddress(pub String);
+queryforge::scalar_newtype!(EmailAddress, String);
+
 fn main() {
     println!(
         "fingerprint: {}",
@@ -37,10 +45,10 @@ async fn run() {
     .await
     .unwrap();
 
-    let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+    let user = db::users::get_user(&conn, db::users::GetUserParams { id: UserId(1) })
         .await
         .unwrap();
-    println!("user: {}", user.email);
+    println!("user: {}", user.email.0);
 
     let users = db::users::list_users(&conn).await.unwrap();
     println!("users: {}", users.len());
@@ -48,7 +56,7 @@ async fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::db;
+    use super::{db, EmailAddress, UserId};
     use queryforge::runtime::libsql_executor::{LibsqlExecutor, LibsqlValue};
 
     #[test]
@@ -75,11 +83,11 @@ mod tests {
             .await
             .unwrap();
 
-            let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+            let user = db::users::get_user(&conn, db::users::GetUserParams { id: UserId(1) })
                 .await
                 .unwrap();
-            assert_eq!(user.id, 1);
-            assert_eq!(user.email, "a@example.com");
+            assert_eq!(user.id, UserId(1));
+            assert_eq!(user.email, EmailAddress("a@example.com".to_string()));
 
             let tx = conn.transaction().await.unwrap();
             LibsqlExecutor::execute(
@@ -92,10 +100,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let tx_user = db::users::get_user(&tx, db::users::GetUserParams { id: 2 })
+            let tx_user = db::users::get_user(&tx, db::users::GetUserParams { id: UserId(2) })
                 .await
                 .unwrap();
-            assert_eq!(tx_user.email, "b@example.com");
+            assert_eq!(tx_user.email, EmailAddress("b@example.com".to_string()));
             tx.rollback().await.unwrap();
 
             let users = db::users::list_users(&conn).await.unwrap();

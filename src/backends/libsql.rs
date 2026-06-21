@@ -66,7 +66,7 @@ fn shape_query(
 ) -> Result<QueryShape> {
     let normalized = normalize_named_params(&q.original_sql, "?");
     let query_analysis = analyze_query(&q.original_sql, catalog, &config.type_mapping)?;
-    let params = normalized
+    let mut params = normalized
         .param_names
         .into_iter()
         .enumerate()
@@ -95,6 +95,24 @@ fn shape_query(
             position: idx + 1,
         })
         .collect::<Vec<_>>();
+    for param in &mut params {
+        if let Some(rust_type) = q.type_overrides.for_param(&param.name) {
+            param.rust_type = rust_type.clone();
+            param.source = TypeSource::UserOverride;
+            param.confidence = InferenceConfidence::UserOverride;
+        }
+    }
+
+    let mut columns = query_analysis.columns;
+    for column in &mut columns {
+        if let Some(rust_type) = q.type_overrides.for_column(&column.name, &column.rust_name) {
+            column.rust_type = rust_type.clone();
+            column.source = TypeSource::UserOverride;
+            column.confidence = InferenceConfidence::UserOverride;
+        }
+    }
+    q.type_overrides
+        .validate_matches(&q.name, &params, &columns)?;
 
     let fp = Fingerprint::from_text(&format!(
         "queryforge-version={}\nbackend={}\nexecution-target={}\ninference-policy={}\ntype-mapping={}\nschema={}\nmigrations={}\nquery={}\ncardinality={:?}\nsql={}\nparams={:?}\ncolumns={:?}\n",
@@ -109,7 +127,7 @@ fn shape_query(
         q.cardinality,
         normalized.sql,
         params,
-        query_analysis.columns
+        columns
     ));
 
     Ok(QueryShape {
@@ -120,7 +138,7 @@ fn shape_query(
         normalized_sql: normalized.sql,
         cardinality: q.cardinality,
         params,
-        columns: query_analysis.columns,
+        columns,
         dependencies: query_analysis.dependencies,
         fingerprint: fp,
     })
@@ -1628,7 +1646,7 @@ mod tests {
         BuildConfig, CodegenConfig, DatabaseBackend, DatabaseConfig, ExecutionTarget,
         InferenceConfig, MigrationsConfig, SchemaConfig,
     };
-    use crate::ir::Cardinality;
+    use crate::ir::{Cardinality, RustType, TypeOverride, TypeOverrideTarget, TypeOverrides};
     use std::path::PathBuf;
 
     #[test]
@@ -1701,6 +1719,7 @@ mod tests {
                 "SELECT id, email, parent_id FROM users WHERE id = :user_id AND email = :email"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         };
 
         let migration_fingerprint = Fingerprint::from_text("migrations");
@@ -1733,6 +1752,90 @@ mod tests {
     }
 
     #[test]
+    fn user_type_overrides_win_over_catalog_inference() {
+        let catalog = catalog();
+        let config = test_config(Vec::new());
+        let query = ParsedQuery {
+            name: "get_user".to_string(),
+            source_file: PathBuf::from("queries/users.sql"),
+            original_sql: "SELECT id, email FROM users WHERE id = :id".to_string(),
+            cardinality: Cardinality::One,
+            type_overrides: TypeOverrides {
+                entries: vec![
+                    TypeOverride {
+                        target: TypeOverrideTarget::Param,
+                        name: "id".to_string(),
+                        rust_type: RustType::new("UserId"),
+                    },
+                    TypeOverride {
+                        target: TypeOverrideTarget::Column,
+                        name: "email".to_string(),
+                        rust_type: RustType::new("EmailAddress"),
+                    },
+                ],
+            },
+        };
+
+        let migration_fingerprint = Fingerprint::from_text("migrations");
+        let shaped = shape_query(
+            &config,
+            &catalog,
+            &catalog.fingerprint,
+            &migration_fingerprint,
+            &Fingerprint::from_text("type-mapping"),
+            query,
+        )
+        .unwrap();
+
+        assert_eq!(shaped.params[0].rust_type.0, "UserId");
+        assert_eq!(shaped.params[0].source, TypeSource::UserOverride);
+        assert_eq!(
+            shaped.params[0].confidence,
+            InferenceConfidence::UserOverride
+        );
+        assert_eq!(shaped.columns[1].rust_type.0, "EmailAddress");
+        assert_eq!(shaped.columns[1].source, TypeSource::UserOverride);
+        assert_eq!(
+            shaped.columns[1].confidence,
+            InferenceConfidence::UserOverride
+        );
+    }
+
+    #[test]
+    fn rejects_type_overrides_that_match_no_generated_field() {
+        let catalog = catalog();
+        let config = test_config(Vec::new());
+        let query = ParsedQuery {
+            name: "get_user".to_string(),
+            source_file: PathBuf::from("queries/users.sql"),
+            original_sql: "SELECT id, email FROM users WHERE id = :id".to_string(),
+            cardinality: Cardinality::One,
+            type_overrides: TypeOverrides {
+                entries: vec![TypeOverride {
+                    target: TypeOverrideTarget::Column,
+                    name: "emali".to_string(),
+                    rust_type: RustType::new("EmailAddress"),
+                }],
+            },
+        };
+
+        let migration_fingerprint = Fingerprint::from_text("migrations");
+        let err = shape_query(
+            &config,
+            &catalog,
+            &catalog.fingerprint,
+            &migration_fingerprint,
+            &Fingerprint::from_text("type-mapping"),
+            query,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("type override `emali` for query `get_user` did not match"));
+    }
+
+    #[test]
     fn infers_mutation_param_types_from_target_table() {
         let catalog = catalog();
         let config = test_config(Vec::new());
@@ -1749,6 +1852,7 @@ mod tests {
                 source_file: PathBuf::from("queries/users.sql"),
                 original_sql: "INSERT INTO users (email, org_id, active) VALUES (:email_address, :org_id, :active)".to_string(),
                 cardinality: Cardinality::Exec,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -1777,6 +1881,7 @@ mod tests {
                     "UPDATE users SET email = :new_email, active = :is_active WHERE id = :user_id"
                         .to_string(),
                 cardinality: Cardinality::Exec,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -1798,6 +1903,7 @@ mod tests {
                 source_file: PathBuf::from("queries/users.sql"),
                 original_sql: "DELETE FROM users WHERE id = :user_id".to_string(),
                 cardinality: Cardinality::Exec,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -1814,6 +1920,7 @@ mod tests {
             source_file: PathBuf::from("queries/users.sql"),
             original_sql: "SELECT *, count(*) AS total, lower(email) AS lower_email, email || '' AS email_expr, coalesce(parent_id, 0) AS parent_fallback, ifnull(parent_id, 0) AS parent_ifnull, length(email) AS email_len, length(parent_id) AS parent_len FROM users".to_string(),
             cardinality: Cardinality::Many,
+            type_overrides: Default::default(),
         };
 
         let migration_fingerprint = Fingerprint::from_text("migrations");
@@ -1914,6 +2021,7 @@ mod tests {
                 source_file: PathBuf::from("queries/uuid.sql"),
                 original_sql: "SELECT uuid4() AS generated_id".to_string(),
                 cardinality: Cardinality::One,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -1934,6 +2042,7 @@ mod tests {
                 source_file: PathBuf::from("queries/uuid.sql"),
                 original_sql: "SELECT gen_random_uuid() AS random_id, uuid7() AS ordered_id, uuid_str(id) AS id_text, uuid_blob(id) AS id_blob, uuid7_timestamp_ms(id) AS id_timestamp_ms FROM users".to_string(),
                 cardinality: Cardinality::Many,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -1971,6 +2080,7 @@ mod tests {
                  WHERE u.id = :user_id AND o.slug = :org_slug"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         };
 
         let migration_fingerprint = Fingerprint::from_text("migrations");
@@ -2018,6 +2128,7 @@ mod tests {
             source_file: PathBuf::from("queries/users.sql"),
             original_sql: "SELECT id FROM users u WHERE (u.id, u.org_id) = (:user_id, :organization_id) AND u.email IN (:primary_email, :secondary_email)".to_string(),
             cardinality: Cardinality::Many,
+            type_overrides: Default::default(),
         };
 
         let migration_fingerprint = Fingerprint::from_text("migrations");
@@ -2056,6 +2167,7 @@ mod tests {
                    AND :user_id IS DISTINCT FROM e.user_id"
                 .to_string(),
             cardinality: Cardinality::Many,
+            type_overrides: Default::default(),
         };
 
         let migration_fingerprint = Fingerprint::from_text("migrations");
@@ -2093,6 +2205,7 @@ mod tests {
                 "SELECT id AS ambiguous_id FROM users u JOIN organizations o ON o.id = u.org_id WHERE id = :id"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         };
 
         let migration_fingerprint = Fingerprint::from_text("migrations");
@@ -2137,6 +2250,7 @@ mod tests {
                 "
                 .to_string(),
                 cardinality: Cardinality::Many,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -2168,6 +2282,7 @@ mod tests {
                 "
                 .to_string(),
                 cardinality: Cardinality::Many,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -2205,6 +2320,7 @@ mod tests {
                 "
                 .to_string(),
                 cardinality: Cardinality::Many,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -2248,6 +2364,7 @@ mod tests {
                 "
                 .to_string(),
                 cardinality: Cardinality::Many,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -2284,6 +2401,7 @@ mod tests {
                 "
                 .to_string(),
                 cardinality: Cardinality::Many,
+                type_overrides: Default::default(),
             },
         )
         .unwrap();
@@ -2315,6 +2433,7 @@ mod tests {
             source_file: PathBuf::from("queries/users.sql"),
             original_sql: "SELECT id, email FROM users WHERE id = :id".to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         }];
 
         let project = inspect(&config, parsed).unwrap();
@@ -2375,6 +2494,7 @@ mod tests {
                 "SELECT id, email, parent_id, active, email_upper FROM users WHERE id = :id"
                     .to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         }];
 
         let project = inspect(&config, parsed).unwrap();
@@ -2463,6 +2583,7 @@ mod tests {
             source_file: PathBuf::from("queries/users.sql"),
             original_sql: "SELECT id, email FROM users WHERE id = :id".to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         }];
 
         let project = inspect(&config, parsed).unwrap();
@@ -2492,6 +2613,7 @@ mod tests {
             source_file: PathBuf::from("queries/users.sql"),
             original_sql: "SELECT id, email FROM users WHERE id = :id".to_string(),
             cardinality: Cardinality::One,
+            type_overrides: Default::default(),
         }];
 
         let project = inspect(&config, parsed).unwrap();

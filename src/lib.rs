@@ -15,6 +15,7 @@ pub mod names;
 pub mod nullability;
 pub mod parser;
 pub mod runtime;
+pub mod scalar;
 pub mod sql_ir;
 pub mod type_map;
 
@@ -28,3 +29,4 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use fingerprint::Fingerprint;
+pub use scalar::{QueryForgeDecode, QueryForgeEncode};

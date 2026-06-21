@@ -1,11 +1,11 @@
 use proc_macro2::TokenStream;
 use quote::quote;
 
-use crate::ir::{Cardinality, QueryShape};
+use crate::ir::{Cardinality, Nullability, QueryShape};
 
 use super::{
     format_query_tokens, lit_str, params_arg, pascal_ident, render_params_struct, rendered_columns,
-    rendered_params, snake_ident, upper_ident,
+    rendered_params, snake_ident, upper_ident, RenderedParam,
 };
 
 pub fn render_query(query: &QueryShape) -> String {
@@ -23,14 +23,11 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
     let row_tokens = render_row_struct(query, &row_name);
     let params_arg = params_arg(query);
     let params_struct = render_params_struct(query);
-    let param_fields = rendered_params(query)
-        .into_iter()
-        .map(|param| param.field)
-        .collect::<Vec<_>>();
+    let params = rendered_params(query);
 
     let body = match query.cardinality {
         Cardinality::Exec => {
-            let query_expr = bind_all(quote! { sqlx::query(#sql_const) }, &param_fields);
+            let query_expr = bind_all(quote! { sqlx::query(#sql_const) }, &params);
             quote! {
                 pub async fn #fn_name<'e, E>(executor: E #params_arg) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>
                 where
@@ -43,7 +40,7 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         Cardinality::Optional => {
             let query_expr = bind_all(
                 quote! { sqlx::query_as::<_, #row_name>(#sql_const) },
-                &param_fields,
+                &params,
             );
             quote! {
                 #row_tokens
@@ -58,7 +55,7 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         Cardinality::Many | Cardinality::Stream | Cardinality::Batch => {
             let query_expr = bind_all(
                 quote! { sqlx::query_as::<_, #row_name>(#sql_const) },
-                &param_fields,
+                &params,
             );
             quote! {
                 #row_tokens
@@ -73,7 +70,7 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         Cardinality::One | Cardinality::Scalar => {
             let query_expr = bind_all(
                 quote! { sqlx::query_as::<_, #row_name>(#sql_const) },
-                &param_fields,
+                &params,
             );
             quote! {
                 #row_tokens
@@ -98,9 +95,15 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
     }
 }
 
-fn bind_all(mut query_expr: TokenStream, params: &[proc_macro2::Ident]) -> TokenStream {
+fn bind_all(mut query_expr: TokenStream, params: &[RenderedParam]) -> TokenStream {
     for param in params {
-        query_expr = quote! { #query_expr.bind(params.#param) };
+        let field = &param.field;
+        let value = if param.encode_override {
+            quote! { queryforge::QueryForgeEncode::queryforge_encode(params.#field) }
+        } else {
+            quote! { params.#field }
+        };
+        query_expr = quote! { #query_expr.bind(#value) };
     }
     query_expr
 }
@@ -119,7 +122,28 @@ fn render_row_struct(query: &QueryShape, row_name: &proc_macro2::Ident) -> Token
     let getters = columns.iter().map(|column| {
         let field = &column.field;
         let index = &column.index;
-        quote! { #field: row.try_get(#index)? }
+        if column.decode_override {
+            let base_ty = &column.base_ty;
+            match column.nullable {
+                Nullability::Nullable => quote! {
+                    #field: {
+                        let raw: Option<<#base_ty as queryforge::QueryForgeDecode>::Storage> = row.try_get(#index)?;
+                        raw.map(<#base_ty as queryforge::QueryForgeDecode>::queryforge_decode)
+                            .transpose()
+                            .map_err(|err| sqlx::Error::Decode(Box::new(err)))?
+                    }
+                },
+                Nullability::NonNull | Nullability::Unknown => quote! {
+                    #field: {
+                        let raw: <#base_ty as queryforge::QueryForgeDecode>::Storage = row.try_get(#index)?;
+                        <#base_ty as queryforge::QueryForgeDecode>::queryforge_decode(raw)
+                            .map_err(|err| sqlx::Error::Decode(Box::new(err)))?
+                    }
+                },
+            }
+        } else {
+            quote! { #field: row.try_get(#index)? }
+        }
     });
 
     quote! {
@@ -203,6 +227,25 @@ mod tests {
                 "}\n"
             )
         );
+    }
+
+    #[test]
+    fn renders_queryforge_scalar_overrides() {
+        let mut query = query(Cardinality::One);
+        query.params[0].rust_type = RustType::new("UserId");
+        query.params[0].source = TypeSource::UserOverride;
+        query.columns[0].rust_type = RustType::new("UserId");
+        query.columns[0].source = TypeSource::UserOverride;
+        let rendered = render_query(&query);
+
+        assert!(rendered.contains("pub id: UserId"));
+        assert!(rendered.contains("QueryForgeEncode"));
+        assert!(rendered.contains("queryforge_encode"));
+        assert!(rendered.contains("params.id"));
+        assert!(rendered.contains("UserId as queryforge::QueryForgeDecode"));
+        assert!(rendered.contains("try_get(0)?"));
+        assert!(rendered.contains("queryforge_decode(raw)"));
+        assert!(rendered.contains("sqlx::Error::Decode(Box::new(err))"));
     }
 
     fn query(cardinality: Cardinality) -> QueryShape {

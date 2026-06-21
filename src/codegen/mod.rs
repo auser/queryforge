@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::config::ExecutionTarget;
 use crate::error::Result;
 use crate::fingerprint::QUERYFORGE_CODEGEN_VERSION;
-use crate::ir::{Nullability, ProjectShape};
+use crate::ir::{Nullability, ProjectShape, TypeSource};
 use crate::names::{to_pascal_case, to_snake_case};
 use crate::nullability::wrap_nullable;
 use proc_macro2::{Ident, Span, TokenStream};
@@ -172,12 +172,16 @@ pub(crate) fn parse_type(value: &str) -> Type {
 pub(crate) struct RenderedColumn {
     pub field: Ident,
     pub ty: Type,
+    pub base_ty: Type,
     pub index: Index,
+    pub nullable: Nullability,
+    pub decode_override: bool,
 }
 
 pub(crate) struct RenderedParam {
     pub field: Ident,
     pub ty: Type,
+    pub encode_override: bool,
 }
 
 pub(crate) fn params_ident(query: &crate::ir::QueryShape) -> Ident {
@@ -191,6 +195,7 @@ pub(crate) fn rendered_params(query: &crate::ir::QueryShape) -> Vec<RenderedPara
         .map(|param| RenderedParam {
             field: snake_ident(&param.name),
             ty: parse_type(&param.rust_type.0),
+            encode_override: param.source == TypeSource::UserOverride,
         })
         .collect()
 }
@@ -245,7 +250,10 @@ pub(crate) fn rendered_columns(query: &crate::ir::QueryShape) -> Vec<RenderedCol
             RenderedColumn {
                 field: format_ident!("{}", field_name),
                 ty: rust_type(&column.rust_type.0, &column.nullable),
+                base_ty: parse_type(&column.rust_type.0),
                 index: Index::from(index),
+                nullable: column.nullable.clone(),
+                decode_override: column.source == TypeSource::UserOverride,
             }
         })
         .collect()

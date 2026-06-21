@@ -7,7 +7,9 @@ use nom::combinator::{opt, recognize};
 use nom::{IResult, Parser};
 
 use crate::error::{Error, Result};
-use crate::ir::{Cardinality, ParsedQuery};
+use crate::ir::{
+    Cardinality, ParsedQuery, RustType, TypeOverride, TypeOverrideTarget, TypeOverrides,
+};
 
 pub fn parse_dir(path: &Path) -> Result<Vec<ParsedQuery>> {
     let mut out = Vec::new();
@@ -96,15 +98,23 @@ fn parse_query_block(block: &str, path: &Path) -> Result<ParsedQuery> {
         ))
     })?;
 
-    let sql = block
-        .lines()
-        .skip(1)
-        .filter(|line| !line.trim_start().starts_with("--:"))
-        .filter(|line| !line.trim_start().starts_with("--#"))
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string();
+    let mut type_overrides = TypeOverrides::default();
+    let mut sql_lines = Vec::new();
+    for line in block.lines().skip(1) {
+        let trimmed = line.trim_start();
+        if let Some(directive) = trimmed.strip_prefix("--:") {
+            type_overrides
+                .entries
+                .push(parse_type_override(directive.trim(), &header.name, path)?);
+            continue;
+        }
+        if trimmed.starts_with("--#") {
+            continue;
+        }
+        sql_lines.push(line);
+    }
+
+    let sql = sql_lines.join("\n").trim().to_string();
 
     if sql.is_empty() {
         return Err(Error::Parse(format!(
@@ -123,6 +133,7 @@ fn parse_query_block(block: &str, path: &Path) -> Result<ParsedQuery> {
         source_file: path.to_path_buf(),
         original_sql: sql,
         cardinality,
+        type_overrides,
     })
 }
 
@@ -179,8 +190,48 @@ fn is_ident_continue(ch: char) -> bool {
 fn infer_cardinality_from_sql(sql: &str) -> Cardinality {
     match first_sql_keyword(sql).as_deref() {
         Some("select" | "with") => Cardinality::Many,
+        Some("insert") if contains_sql_keyword(sql, "returning") => Cardinality::One,
+        Some("update" | "delete") if contains_sql_keyword(sql, "returning") => Cardinality::Many,
         _ => Cardinality::Exec,
     }
+}
+
+fn parse_type_override(directive: &str, query_name: &str, path: &Path) -> Result<TypeOverride> {
+    let Some((target, rust_type)) = directive.split_once(':') else {
+        return Err(Error::Parse(format!(
+            "invalid type override for query `{query_name}` in {}; expected `--: name: RustType`, `--: param.name: RustType`, or `--: column.name: RustType`",
+            path.display()
+        )));
+    };
+    let target = target.trim();
+    let rust_type = rust_type.trim();
+    if target.is_empty() || rust_type.is_empty() {
+        return Err(Error::Parse(format!(
+            "invalid type override for query `{query_name}` in {}; override target and type must be non-empty",
+            path.display()
+        )));
+    }
+
+    let (target_kind, name) = if let Some(name) = target.strip_prefix("param.") {
+        (TypeOverrideTarget::Param, name)
+    } else if let Some(name) = target.strip_prefix("column.") {
+        (TypeOverrideTarget::Column, name)
+    } else {
+        (TypeOverrideTarget::Any, target)
+    };
+
+    if name.is_empty() {
+        return Err(Error::Parse(format!(
+            "invalid type override for query `{query_name}` in {}; override name must be non-empty",
+            path.display()
+        )));
+    }
+
+    Ok(TypeOverride {
+        target: target_kind,
+        name: name.to_string(),
+        rust_type: RustType::new(rust_type),
+    })
 }
 
 fn first_sql_keyword(sql: &str) -> Option<String> {
@@ -230,6 +281,85 @@ fn first_sql_keyword(sql: &str) -> Option<String> {
     None
 }
 
+fn contains_sql_keyword(sql: &str, keyword: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut idx = 0;
+    let keyword = keyword.to_ascii_lowercase();
+
+    while idx < bytes.len() {
+        if bytes.get(idx..idx + 2) == Some(b"--") {
+            idx += 2;
+            while idx < bytes.len() && bytes[idx] != b'\n' {
+                idx += 1;
+            }
+            continue;
+        }
+
+        if bytes.get(idx..idx + 2) == Some(b"/*") {
+            idx += 2;
+            while idx + 1 < bytes.len() && bytes.get(idx..idx + 2) != Some(b"*/") {
+                idx += 1;
+            }
+            idx = (idx + 2).min(bytes.len());
+            continue;
+        }
+
+        if bytes.get(idx) == Some(&b'\'') {
+            idx += 1;
+            while idx < bytes.len() {
+                if bytes[idx] == b'\'' {
+                    idx += 1;
+                    if bytes.get(idx) == Some(&b'\'') {
+                        idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+                idx += 1;
+            }
+            continue;
+        }
+
+        if bytes.get(idx) == Some(&b'"') {
+            idx += 1;
+            while idx < bytes.len() {
+                if bytes[idx] == b'"' {
+                    idx += 1;
+                    if bytes.get(idx) == Some(&b'"') {
+                        idx += 1;
+                        continue;
+                    }
+                    break;
+                }
+                idx += 1;
+            }
+            continue;
+        }
+
+        if bytes
+            .get(idx)
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+        {
+            let start = idx;
+            idx += 1;
+            while bytes
+                .get(idx)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                idx += 1;
+            }
+            if sql[start..idx].eq_ignore_ascii_case(&keyword) {
+                return true;
+            }
+            continue;
+        }
+
+        idx += 1;
+    }
+
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +393,19 @@ mod tests {
     }
 
     #[test]
+    fn infers_returning_mutation_cardinality_when_header_omits_it() {
+        let source = "--! insert_user\nINSERT INTO users (email) VALUES (:email) RETURNING id;\n\n--! update_users\nUPDATE users SET active = true RETURNING id;\n\n--! delete_users\nDELETE FROM users WHERE active = false RETURNING id;";
+        let parsed = parse_queries(source, Path::new("queries/users.sql")).unwrap();
+
+        assert_eq!(parsed[0].name, "insert_user");
+        assert_eq!(parsed[0].cardinality, Cardinality::One);
+        assert_eq!(parsed[1].name, "update_users");
+        assert_eq!(parsed[1].cardinality, Cardinality::Many);
+        assert_eq!(parsed[2].name, "delete_users");
+        assert_eq!(parsed[2].cardinality, Cardinality::Many);
+    }
+
+    #[test]
     fn explicit_cardinality_overrides_sql_inference() {
         let source =
             "--! insert_user : one\nINSERT INTO users (email) VALUES (:email) RETURNING id;";
@@ -282,13 +425,41 @@ mod tests {
     }
 
     #[test]
-    fn ignores_queryforge_annotation_lines_in_body() {
+    fn parses_type_override_annotation_lines() {
         let parsed = parse_queries(
-            "--! annotated : many\n--: future type annotation\n--# future directive\nSELECT 1;",
+            "--! annotated : many\n--: param.id: UserId\n--: column.email: EmailAddress\n--: country: CountryCode\n--# future directive\nSELECT id, email, country FROM users WHERE id = :id;",
             Path::new("queries/annotated.sql"),
         )
         .unwrap();
 
-        assert_eq!(parsed[0].original_sql, "SELECT 1;");
+        assert_eq!(
+            parsed[0].original_sql,
+            "SELECT id, email, country FROM users WHERE id = :id;"
+        );
+        assert_eq!(parsed[0].type_overrides.entries.len(), 3);
+        assert_eq!(
+            parsed[0].type_overrides.entries[0].target,
+            TypeOverrideTarget::Param
+        );
+        assert_eq!(parsed[0].type_overrides.entries[0].name, "id");
+        assert_eq!(parsed[0].type_overrides.entries[0].rust_type.0, "UserId");
+        assert_eq!(
+            parsed[0].type_overrides.entries[1].target,
+            TypeOverrideTarget::Column
+        );
+        assert_eq!(parsed[0].type_overrides.entries[1].name, "email");
+        assert_eq!(
+            parsed[0].type_overrides.entries[1].rust_type.0,
+            "EmailAddress"
+        );
+        assert_eq!(
+            parsed[0].type_overrides.entries[2].target,
+            TypeOverrideTarget::Any
+        );
+        assert_eq!(parsed[0].type_overrides.entries[2].name, "country");
+        assert_eq!(
+            parsed[0].type_overrides.entries[2].rust_type.0,
+            "CountryCode"
+        );
     }
 }
