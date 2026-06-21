@@ -37,7 +37,9 @@ async fn run() {
     .await
     .unwrap();
 
-    let user = db::users::get_user(&conn, 1).await.unwrap();
+    let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+        .await
+        .unwrap();
     println!("user: {}", user.email);
 
     let users = db::users::list_users(&conn).await.unwrap();
@@ -73,7 +75,9 @@ mod tests {
             .await
             .unwrap();
 
-            let user = db::users::get_user(&conn, 1).await.unwrap();
+            let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+                .await
+                .unwrap();
             assert_eq!(user.id, 1);
             assert_eq!(user.email, "a@example.com");
 
@@ -88,7 +92,9 @@ mod tests {
             )
             .await
             .unwrap();
-            let tx_user = db::users::get_user(&tx, 2).await.unwrap();
+            let tx_user = db::users::get_user(&tx, db::users::GetUserParams { id: 2 })
+                .await
+                .unwrap();
             assert_eq!(tx_user.email, "b@example.com");
             tx.rollback().await.unwrap();
 

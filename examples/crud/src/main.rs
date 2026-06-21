@@ -25,17 +25,38 @@ async fn run() {
     let conn = database.connect().unwrap();
     create_schema(&conn).await;
 
-    db::users::create_user(&conn, 1, "a@example.com".into(), "Ada".into(), true)
-        .await
-        .unwrap();
-    db::users::upsert_user(&conn, 1, "ada@queryforge.dev".into(), "Ada Q.".into(), true)
-        .await
-        .unwrap();
+    db::users::create_user(
+        &conn,
+        db::users::CreateUserParams {
+            id: 1,
+            email: "a@example.com".into(),
+            name: "Ada".into(),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
+    db::users::upsert_user(
+        &conn,
+        db::users::UpsertUserParams {
+            id: 1,
+            email: "ada@queryforge.dev".into(),
+            name: "Ada Q.".into(),
+            active: true,
+        },
+    )
+    .await
+    .unwrap();
 
-    let user = db::users::get_user(&conn, 1).await.unwrap().unwrap();
+    let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+        .await
+        .unwrap()
+        .unwrap();
     println!("user after upsert: {} ({})", user.email, user.name);
 
-    db::users::delete_user(&conn, 1).await.unwrap();
+    db::users::delete_user(&conn, db::users::DeleteUserParams { id: 1 })
+        .await
+        .unwrap();
     println!(
         "users after delete: {}",
         db::users::list_users(&conn).await.unwrap().len()
@@ -71,56 +92,91 @@ mod tests {
             let conn = database.connect().unwrap();
             create_schema(&conn).await;
 
-            let inserted =
-                db::users::create_user(&conn, 1, "a@example.com".into(), "Ada".into(), true)
-                    .await
-                    .unwrap();
+            let inserted = db::users::create_user(
+                &conn,
+                db::users::CreateUserParams {
+                    id: 1,
+                    email: "a@example.com".into(),
+                    name: "Ada".into(),
+                    active: true,
+                },
+            )
+            .await
+            .unwrap();
             assert_eq!(inserted, 1);
 
-            let user = db::users::get_user(&conn, 1).await.unwrap().unwrap();
+            let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(user.email, "a@example.com");
             assert_eq!(user.name, "Ada");
             assert!(user.active);
 
             let updated = db::users::update_user(
                 &conn,
-                "ada@example.com".into(),
-                "Ada Lovelace".into(),
-                false,
-                1,
+                db::users::UpdateUserParams {
+                    email: "ada@example.com".into(),
+                    name: "Ada Lovelace".into(),
+                    active: false,
+                    id: 1,
+                },
             )
             .await
             .unwrap();
             assert_eq!(updated, 1);
-            let user = db::users::get_user(&conn, 1).await.unwrap().unwrap();
+            let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(user.email, "ada@example.com");
             assert_eq!(user.name, "Ada Lovelace");
             assert!(!user.active);
 
             let upserted = db::users::upsert_user(
                 &conn,
-                1,
-                "ada@queryforge.dev".into(),
-                "Ada Q.".into(),
-                true,
+                db::users::UpsertUserParams {
+                    id: 1,
+                    email: "ada@queryforge.dev".into(),
+                    name: "Ada Q.".into(),
+                    active: true,
+                },
             )
             .await
             .unwrap();
             assert_eq!(upserted, 1);
-            let user = db::users::get_user(&conn, 1).await.unwrap().unwrap();
+            let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(user.email, "ada@queryforge.dev");
             assert_eq!(user.name, "Ada Q.");
             assert!(user.active);
 
-            db::users::create_user(&conn, 2, "b@example.com".into(), "Babbage".into(), true)
-                .await
-                .unwrap();
+            db::users::create_user(
+                &conn,
+                db::users::CreateUserParams {
+                    id: 2,
+                    email: "b@example.com".into(),
+                    name: "Babbage".into(),
+                    active: true,
+                },
+            )
+            .await
+            .unwrap();
             let users = db::users::list_users(&conn).await.unwrap();
             assert_eq!(users.len(), 2);
 
-            let deleted = db::users::delete_user(&conn, 1).await.unwrap();
+            let deleted = db::users::delete_user(&conn, db::users::DeleteUserParams { id: 1 })
+                .await
+                .unwrap();
             assert_eq!(deleted, 1);
-            assert!(db::users::get_user(&conn, 1).await.unwrap().is_none());
+            assert!(
+                db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 }

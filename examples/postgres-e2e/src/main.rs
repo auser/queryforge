@@ -26,20 +26,32 @@ async fn run() -> Result<(), sqlx::Error> {
         .execute(&pool)
         .await?;
 
-    let inserted =
-        db::users::create_user(&pool, 1, "ada@example.com".into(), "Ada".into(), true).await?;
+    let inserted = db::users::create_user(
+        &pool,
+        db::users::CreateUserParams {
+            id: 1,
+            email: "ada@example.com".into(),
+            name: "Ada".into(),
+            active: true,
+        },
+    )
+    .await?;
     println!("inserted rows: {}", inserted.rows_affected());
 
-    let user = db::users::get_user(&pool, 1).await?.expect("user exists");
+    let user = db::users::get_user(&pool, db::users::GetUserParams { id: 1 })
+        .await?
+        .expect("user exists");
     println!("loaded user: {} ({})", user.email, user.name);
 
     let mut tx = pool.begin().await?;
     db::users::update_user(
         &mut *tx,
-        "ada@queryforge.dev".into(),
-        "Ada Q.".into(),
-        false,
-        1,
+        db::users::UpdateUserParams {
+            email: "ada@queryforge.dev".into(),
+            name: "Ada Q.".into(),
+            active: false,
+            id: 1,
+        },
     )
     .await?;
     tx.commit().await?;
@@ -47,7 +59,7 @@ async fn run() -> Result<(), sqlx::Error> {
     let users = db::users::list_users(&pool).await?;
     println!("users after transaction update: {}", users.len());
 
-    let deleted = db::users::delete_user(&pool, 1).await?;
+    let deleted = db::users::delete_user(&pool, db::users::DeleteUserParams { id: 1 }).await?;
     println!("deleted rows: {}", deleted.rows_affected());
 
     Ok(())

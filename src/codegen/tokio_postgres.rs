@@ -4,8 +4,8 @@ use quote::quote;
 use crate::ir::{Cardinality, QueryShape};
 
 use super::{
-    format_query_tokens, lit_str, parse_type, pascal_ident, rendered_columns, snake_ident,
-    upper_ident,
+    format_query_tokens, lit_str, params_arg, pascal_ident, render_params_struct, rendered_columns,
+    rendered_params, snake_ident, upper_ident,
 };
 
 pub fn render_query(query: &QueryShape) -> String {
@@ -21,28 +21,29 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
     let fingerprint = lit_str(query.fingerprint.as_str());
     let row_name = pascal_ident(&format!("{}_row", query.name));
     let row_tokens = render_row_struct(query, &row_name);
-    let param_args = render_param_args(query);
+    let params_arg = params_arg(query);
+    let params_struct = render_params_struct(query);
     let param_slice = render_param_slice(query);
 
     let body = match query.cardinality {
         Cardinality::Exec => quote! {
-            pub async fn #fn_name<C>(client: &C #(, #param_args)*) -> Result<u64, tokio_postgres::Error>
+            pub async fn #fn_name<C>(client: &C #params_arg) -> Result<u64, tokio_postgres::Error>
             where
                 C: tokio_postgres::GenericClient + Sync,
             {
                 #param_slice
-                client.execute(#sql_const, params).await
+                client.execute(#sql_const, query_params).await
             }
         },
         Cardinality::Optional => quote! {
             #row_tokens
-            pub async fn #fn_name<C>(client: &C #(, #param_args)*) -> Result<Option<#row_name>, tokio_postgres::Error>
+            pub async fn #fn_name<C>(client: &C #params_arg) -> Result<Option<#row_name>, tokio_postgres::Error>
             where
                 C: tokio_postgres::GenericClient + Sync,
             {
                 #param_slice
                 client
-                    .query_opt(#sql_const, params)
+                    .query_opt(#sql_const, query_params)
                     .await?
                     .map(#row_name::try_from)
                     .transpose()
@@ -50,13 +51,13 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         },
         Cardinality::Many | Cardinality::Stream | Cardinality::Batch => quote! {
             #row_tokens
-            pub async fn #fn_name<C>(client: &C #(, #param_args)*) -> Result<Vec<#row_name>, tokio_postgres::Error>
+            pub async fn #fn_name<C>(client: &C #params_arg) -> Result<Vec<#row_name>, tokio_postgres::Error>
             where
                 C: tokio_postgres::GenericClient + Sync,
             {
                 #param_slice
                 client
-                    .query(#sql_const, params)
+                    .query(#sql_const, query_params)
                     .await?
                     .into_iter()
                     .map(#row_name::try_from)
@@ -65,12 +66,12 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         },
         Cardinality::One | Cardinality::Scalar => quote! {
             #row_tokens
-            pub async fn #fn_name<C>(client: &C #(, #param_args)*) -> Result<#row_name, tokio_postgres::Error>
+            pub async fn #fn_name<C>(client: &C #params_arg) -> Result<#row_name, tokio_postgres::Error>
             where
                 C: tokio_postgres::GenericClient + Sync,
             {
                 #param_slice
-                let row = client.query_one(#sql_const, params).await?;
+                let row = client.query_one(#sql_const, query_params).await?;
                 #row_name::try_from(row)
             }
         },
@@ -82,6 +83,7 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         pub fn #sql_fn() -> &'static str {
             #sql_const
         }
+        #params_struct
         #body
     }
 }
@@ -121,28 +123,16 @@ fn render_row_struct(query: &QueryShape, row_name: &proc_macro2::Ident) -> Token
     }
 }
 
-fn render_param_args(query: &QueryShape) -> Vec<TokenStream> {
-    query
-        .params
-        .iter()
-        .map(|param| {
-            let name = snake_ident(&param.name);
-            let ty = parse_type(&param.rust_type.0);
-            quote! { #name: #ty }
-        })
-        .collect()
-}
-
 fn render_param_slice(query: &QueryShape) -> TokenStream {
     if query.params.is_empty() {
         return quote! {
-            let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[];
+            let query_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[];
         };
     }
 
-    let params = query.params.iter().map(|param| snake_ident(&param.name));
+    let params = rendered_params(query).into_iter().map(|param| param.field);
     quote! {
-        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[#( &#params ),*];
+        let query_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[#( &params.#params ),*];
     }
 }
 
@@ -161,11 +151,13 @@ mod tests {
         let rendered = render_query(&query(Cardinality::One));
 
         assert!(rendered.contains("C: tokio_postgres::GenericClient + Sync"));
+        assert!(rendered.contains("pub struct GetUserParams"));
         assert!(rendered.contains("pub struct GetUserRow"));
         assert!(rendered.contains("impl TryFrom<tokio_postgres::Row> for GetUserRow"));
-        assert!(rendered
-            .contains("let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&id];"));
-        assert!(rendered.contains("client.query_one(GET_USER_SQL, params).await?"));
+        assert!(rendered.contains(
+            "let query_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&params.id];"
+        ));
+        assert!(rendered.contains("client.query_one(GET_USER_SQL, query_params).await?"));
         assert!(rendered.contains("email: row.try_get(1)?"));
     }
 
@@ -175,19 +167,19 @@ mod tests {
 
         assert!(rendered.contains("pub async fn get_user<C>("));
         assert!(rendered.contains("client: &C,"));
-        assert!(rendered.contains("id: i64,"));
+        assert!(rendered.contains("params: GetUserParams,"));
         assert!(rendered.contains("C: tokio_postgres::GenericClient + Sync"));
-        assert!(rendered.contains("client.query_one(GET_USER_SQL, params).await?"));
+        assert!(rendered.contains("client.query_one(GET_USER_SQL, query_params).await?"));
     }
 
     #[test]
     fn renders_optional_and_many_cardinalities() {
         let optional = render_query(&query(Cardinality::Optional));
-        assert!(optional.contains(".query_opt(GET_USER_SQL, params)"));
+        assert!(optional.contains(".query_opt(GET_USER_SQL, query_params)"));
         assert!(optional.contains(".transpose()"));
 
         let many = render_query(&query(Cardinality::Many));
-        assert!(many.contains(".query(GET_USER_SQL, params)"));
+        assert!(many.contains(".query(GET_USER_SQL, query_params)"));
         assert!(many.contains(".collect()"));
     }
 
@@ -200,7 +192,7 @@ mod tests {
         });
 
         assert!(rendered.contains("Result<u64, tokio_postgres::Error>"));
-        assert!(rendered.contains("client.execute(GET_USER_SQL, params).await"));
+        assert!(rendered.contains("client.execute(GET_USER_SQL, query_params).await"));
     }
 
     #[test]
@@ -212,6 +204,10 @@ mod tests {
                 "pub const GET_USER_FINGERPRINT: &str = \"fnv1a64:6d9ac38b89586d5b\";\n",
                 "pub fn get_user_sql() -> &'static str {\n",
                 "    GET_USER_SQL\n",
+                "}\n",
+                "#[derive(Debug, Clone)]\n",
+                "pub struct GetUserParams {\n",
+                "    pub id: i64,\n",
                 "}\n",
                 "#[derive(Debug, Clone)]\n",
                 "pub struct GetUserRow {\n",
@@ -229,13 +225,13 @@ mod tests {
                 "}\n",
                 "pub async fn get_user<C>(\n",
                 "    client: &C,\n",
-                "    id: i64,\n",
+                "    params: GetUserParams,\n",
                 ") -> Result<GetUserRow, tokio_postgres::Error>\n",
                 "where\n",
                 "    C: tokio_postgres::GenericClient + Sync,\n",
                 "{\n",
-                "    let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&id];\n",
-                "    let row = client.query_one(GET_USER_SQL, params).await?;\n",
+                "    let query_params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&params.id];\n",
+                "    let row = client.query_one(GET_USER_SQL, query_params).await?;\n",
                 "    GetUserRow::try_from(row)\n",
                 "}\n"
             )

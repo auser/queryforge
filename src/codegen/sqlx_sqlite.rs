@@ -4,8 +4,8 @@ use quote::quote;
 use crate::ir::{Cardinality, QueryShape};
 
 use super::{
-    format_query_tokens, lit_str, parse_type, pascal_ident, rendered_columns, snake_ident,
-    upper_ident,
+    format_query_tokens, lit_str, params_arg, pascal_ident, render_params_struct, rendered_columns,
+    rendered_params, snake_ident, upper_ident,
 };
 
 pub fn render_query(query: &QueryShape) -> String {
@@ -21,18 +21,18 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
     let fingerprint = lit_str(query.fingerprint.as_str());
     let row_name = pascal_ident(&format!("{}_row", query.name));
     let row_tokens = render_row_struct(query, &row_name);
-    let param_args = render_param_args(query);
-    let param_idents = query
-        .params
-        .iter()
-        .map(|param| snake_ident(&param.name))
+    let params_arg = params_arg(query);
+    let params_struct = render_params_struct(query);
+    let param_fields = rendered_params(query)
+        .into_iter()
+        .map(|param| param.field)
         .collect::<Vec<_>>();
 
     let body = match query.cardinality {
         Cardinality::Exec => {
-            let query_expr = bind_all(quote! { sqlx::query(#sql_const) }, &param_idents);
+            let query_expr = bind_all(quote! { sqlx::query(#sql_const) }, &param_fields);
             quote! {
-                pub async fn #fn_name<'e, E>(executor: E #(, #param_args)*) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>
+                pub async fn #fn_name<'e, E>(executor: E #params_arg) -> Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>
                 where
                     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
                 {
@@ -43,11 +43,11 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         Cardinality::Optional => {
             let query_expr = bind_all(
                 quote! { sqlx::query_as::<_, #row_name>(#sql_const) },
-                &param_idents,
+                &param_fields,
             );
             quote! {
                 #row_tokens
-                pub async fn #fn_name<'e, E>(executor: E #(, #param_args)*) -> Result<Option<#row_name>, sqlx::Error>
+                pub async fn #fn_name<'e, E>(executor: E #params_arg) -> Result<Option<#row_name>, sqlx::Error>
                 where
                     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
                 {
@@ -58,11 +58,11 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         Cardinality::Many | Cardinality::Stream | Cardinality::Batch => {
             let query_expr = bind_all(
                 quote! { sqlx::query_as::<_, #row_name>(#sql_const) },
-                &param_idents,
+                &param_fields,
             );
             quote! {
                 #row_tokens
-                pub async fn #fn_name<'e, E>(executor: E #(, #param_args)*) -> Result<Vec<#row_name>, sqlx::Error>
+                pub async fn #fn_name<'e, E>(executor: E #params_arg) -> Result<Vec<#row_name>, sqlx::Error>
                 where
                     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
                 {
@@ -73,11 +73,11 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         Cardinality::One | Cardinality::Scalar => {
             let query_expr = bind_all(
                 quote! { sqlx::query_as::<_, #row_name>(#sql_const) },
-                &param_idents,
+                &param_fields,
             );
             quote! {
                 #row_tokens
-                pub async fn #fn_name<'e, E>(executor: E #(, #param_args)*) -> Result<#row_name, sqlx::Error>
+                pub async fn #fn_name<'e, E>(executor: E #params_arg) -> Result<#row_name, sqlx::Error>
                 where
                     E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
                 {
@@ -93,13 +93,14 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         pub fn #sql_fn() -> &'static str {
             #sql_const
         }
+        #params_struct
         #body
     }
 }
 
 fn bind_all(mut query_expr: TokenStream, params: &[proc_macro2::Ident]) -> TokenStream {
     for param in params {
-        query_expr = quote! { #query_expr.bind(#param) };
+        query_expr = quote! { #query_expr.bind(params.#param) };
     }
     query_expr
 }
@@ -138,18 +139,6 @@ fn render_row_struct(query: &QueryShape, row_name: &proc_macro2::Ident) -> Token
     }
 }
 
-fn render_param_args(query: &QueryShape) -> Vec<TokenStream> {
-    query
-        .params
-        .iter()
-        .map(|param| {
-            let name = snake_ident(&param.name);
-            let ty = parse_type(&param.rust_type.0);
-            quote! { #name: #ty }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,7 +153,10 @@ mod tests {
     fn renders_transaction_compatible_executor_shape() {
         let rendered = render_query(&query(Cardinality::One));
 
-        assert!(rendered.contains("pub async fn get_user<'e, E>(executor: E, id: i64)"));
+        assert!(rendered.contains("pub struct GetUserParams"));
+        assert!(rendered.contains("pub async fn get_user<'e, E>("));
+        assert!(rendered.contains("executor: E,"));
+        assert!(rendered.contains("params: GetUserParams,"));
         assert!(rendered.contains("E: sqlx::Executor<'e, Database = sqlx::Sqlite>"));
         assert!(rendered.contains(".fetch_one(executor)"));
     }
@@ -180,6 +172,10 @@ mod tests {
                 "    GET_USER_SQL\n",
                 "}\n",
                 "#[derive(Debug, Clone)]\n",
+                "pub struct GetUserParams {\n",
+                "    pub id: i64,\n",
+                "}\n",
+                "#[derive(Debug, Clone)]\n",
                 "pub struct GetUserRow {\n",
                 "    pub id: i64,\n",
                 "    pub email: Option<String>,\n",
@@ -193,11 +189,17 @@ mod tests {
                 "        })\n",
                 "    }\n",
                 "}\n",
-                "pub async fn get_user<'e, E>(executor: E, id: i64) -> Result<GetUserRow, sqlx::Error>\n",
+                "pub async fn get_user<'e, E>(\n",
+                "    executor: E,\n",
+                "    params: GetUserParams,\n",
+                ") -> Result<GetUserRow, sqlx::Error>\n",
                 "where\n",
                 "    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,\n",
                 "{\n",
-                "    sqlx::query_as::<_, GetUserRow>(GET_USER_SQL).bind(id).fetch_one(executor).await\n",
+                "    sqlx::query_as::<_, GetUserRow>(GET_USER_SQL)\n",
+                "        .bind(params.id)\n",
+                "        .fetch_one(executor)\n",
+                "        .await\n",
                 "}\n"
             )
         );

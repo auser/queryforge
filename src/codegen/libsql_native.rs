@@ -4,8 +4,8 @@ use quote::quote;
 use crate::ir::{Cardinality, QueryShape};
 
 use super::{
-    format_query_tokens, lit_str, parse_type, pascal_ident, rendered_columns, snake_ident,
-    upper_ident,
+    format_query_tokens, lit_str, params_arg, pascal_ident, render_params_struct, rendered_columns,
+    rendered_params, snake_ident, upper_ident,
 };
 
 pub fn render_query(query: &QueryShape) -> String {
@@ -21,28 +21,29 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
     let fingerprint = lit_str(query.fingerprint.as_str());
     let row_name = pascal_ident(&format!("{}_row", query.name));
     let row_tokens = render_row_struct(query, &row_name);
-    let param_args = render_param_args(query);
+    let params_arg = params_arg(query);
+    let params_struct = render_params_struct(query);
     let param_values = render_param_values(query);
 
     let body = match query.cardinality {
         Cardinality::Exec => quote! {
-            pub async fn #fn_name<E>(executor: &E #(, #param_args)*) -> queryforge::Result<u64>
+            pub async fn #fn_name<E>(executor: &E #params_arg) -> queryforge::Result<u64>
             where
                 E: queryforge::runtime::libsql_executor::LibsqlExecutor + ?Sized,
             {
                 #param_values
-                executor.execute(#sql_const, &params).await
+                executor.execute(#sql_const, &query_params).await
             }
         },
         Cardinality::Optional => quote! {
             #row_tokens
-            pub async fn #fn_name<E>(executor: &E #(, #param_args)*) -> queryforge::Result<Option<#row_name>>
+            pub async fn #fn_name<E>(executor: &E #params_arg) -> queryforge::Result<Option<#row_name>>
             where
                 E: queryforge::runtime::libsql_executor::LibsqlExecutor + ?Sized,
             {
                 #param_values
                 executor
-                    .query_optional(#sql_const, &params)
+                    .query_optional(#sql_const, &query_params)
                     .await?
                     .map(#row_name::try_from)
                     .transpose()
@@ -50,13 +51,13 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         },
         Cardinality::Many | Cardinality::Stream | Cardinality::Batch => quote! {
             #row_tokens
-            pub async fn #fn_name<E>(executor: &E #(, #param_args)*) -> queryforge::Result<Vec<#row_name>>
+            pub async fn #fn_name<E>(executor: &E #params_arg) -> queryforge::Result<Vec<#row_name>>
             where
                 E: queryforge::runtime::libsql_executor::LibsqlExecutor + ?Sized,
             {
                 #param_values
                 executor
-                    .query_many(#sql_const, &params)
+                    .query_many(#sql_const, &query_params)
                     .await?
                     .into_iter()
                     .map(#row_name::try_from)
@@ -65,12 +66,12 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         },
         Cardinality::One | Cardinality::Scalar => quote! {
             #row_tokens
-            pub async fn #fn_name<E>(executor: &E #(, #param_args)*) -> queryforge::Result<#row_name>
+            pub async fn #fn_name<E>(executor: &E #params_arg) -> queryforge::Result<#row_name>
             where
                 E: queryforge::runtime::libsql_executor::LibsqlExecutor + ?Sized,
             {
                 #param_values
-                let row = executor.query_one(#sql_const, &params).await?;
+                let row = executor.query_one(#sql_const, &query_params).await?;
                 #row_name::try_from(row)
             }
         },
@@ -82,6 +83,7 @@ fn render_query_tokens(query: &QueryShape) -> TokenStream {
         pub fn #sql_fn() -> &'static str {
             #sql_const
         }
+        #params_struct
         #body
     }
 }
@@ -121,31 +123,19 @@ fn render_row_struct(query: &QueryShape, row_name: &proc_macro2::Ident) -> Token
     }
 }
 
-fn render_param_args(query: &QueryShape) -> Vec<TokenStream> {
-    query
-        .params
-        .iter()
-        .map(|param| {
-            let name = snake_ident(&param.name);
-            let ty = parse_type(&param.rust_type.0);
-            quote! { #name: #ty }
-        })
-        .collect()
-}
-
 fn render_param_values(query: &QueryShape) -> TokenStream {
     if query.params.is_empty() {
         return quote! {
-            let params: Vec<queryforge::runtime::libsql_executor::LibsqlValue> = Vec::new();
+            let query_params: Vec<queryforge::runtime::libsql_executor::LibsqlValue> = Vec::new();
         };
     }
 
-    let values = query.params.iter().map(|param| {
-        let name = snake_ident(&param.name);
-        quote! { queryforge::runtime::libsql_executor::LibsqlValue::from(#name) }
+    let values = rendered_params(query).into_iter().map(|param| {
+        let field = param.field;
+        quote! { queryforge::runtime::libsql_executor::LibsqlValue::from(params.#field) }
     });
     quote! {
-        let params = vec![#( #values ),*];
+        let query_params = vec![#( #values ),*];
     }
 }
 
@@ -163,13 +153,18 @@ mod tests {
     fn renders_transaction_shaped_executor_signature() {
         let rendered = render_query(&query(Cardinality::One));
 
-        assert!(rendered.contains("pub async fn get_user<E>(executor: &E, id: i64)"));
+        assert!(rendered.contains("pub struct GetUserParams"));
+        assert!(rendered.contains("pub id: i64"));
+        assert!(rendered.contains("pub async fn get_user<E>("));
+        assert!(rendered.contains("params: GetUserParams"));
         assert!(
             rendered.contains("E: queryforge::runtime::libsql_executor::LibsqlExecutor + ?Sized")
         );
         assert!(rendered.contains("queryforge::Result<GetUserRow>"));
-        assert!(rendered.contains("queryforge::runtime::libsql_executor::LibsqlValue::from(id)"));
-        assert!(rendered.contains("executor.query_one(GET_USER_SQL, &params).await?"));
+        assert!(
+            rendered.contains("queryforge::runtime::libsql_executor::LibsqlValue::from(params.id)")
+        );
+        assert!(rendered.contains("executor.query_one(GET_USER_SQL, &query_params).await?"));
         assert!(rendered.contains(
             "impl TryFrom<queryforge::runtime::libsql_executor::LibsqlRow> for GetUserRow"
         ));
@@ -184,7 +179,7 @@ mod tests {
         });
 
         assert!(rendered.contains("queryforge::Result<u64>"));
-        assert!(rendered.contains("executor.execute(GET_USER_SQL, &params).await"));
+        assert!(rendered.contains("executor.execute(GET_USER_SQL, &query_params).await"));
     }
 
     fn query(cardinality: Cardinality) -> QueryShape {

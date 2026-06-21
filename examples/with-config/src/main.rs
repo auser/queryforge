@@ -36,14 +36,18 @@ async fn run() {
 
     db::users::create_user(
         &conn,
-        "a@example.com".to_string(),
-        "Ada".to_string(),
-        "2026-06-17".to_string(),
+        db::users::CreateUserParams {
+            email: "a@example.com".to_string(),
+            name: "Ada".to_string(),
+            created_at: "2026-06-17".to_string(),
+        },
     )
     .await
     .unwrap();
 
-    let user = db::users::get_user(&conn, 1).await.unwrap();
+    let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+        .await
+        .unwrap();
     println!("user: {} ({})", user.email, user.name);
 
     let users = db::users::list_users(&conn).await.unwrap();

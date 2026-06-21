@@ -27,7 +27,9 @@ async fn run() {
         .unwrap();
     let conn = database.connect().unwrap();
 
-    let user = db::users::get_user(&conn, 1).await.unwrap();
+    let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+        .await
+        .unwrap();
     println!("user: {} ({})", user.email, user.org_slug);
 
     let users = db::users::list_users(&conn).await.unwrap();

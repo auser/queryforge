@@ -35,14 +35,18 @@ async fn run() {
 
     db::users::insert_user(
         &conn,
-        1,
-        "a@example.com".to_string(),
-        "2026-06-17".to_string(),
+        db::users::InsertUserParams {
+            id: 1,
+            email: "a@example.com".to_string(),
+            created_at: "2026-06-17".to_string(),
+        },
     )
     .await
     .unwrap();
 
-    let user = db::users::get_user(&conn, 1).await.unwrap();
+    let user = db::users::get_user(&conn, db::users::GetUserParams { id: 1 })
+        .await
+        .unwrap();
     println!("inserted user: {} at {}", user.email, user.created_at);
 
     let users = db::users::list_users(&conn).await.unwrap();

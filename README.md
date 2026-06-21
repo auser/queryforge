@@ -34,6 +34,26 @@ VALUES (:first_name, :last_name, :country);
 SELECT first_name, last_name, country FROM authors;
 ```
 
+For a native libSQL target, call the generated functions like this:
+
+```rust
+let inserted = db::authors::insert_author(
+    &conn,
+    db::authors::InsertAuthorParams {
+        first_name: "Octavia".to_string(),
+        last_name: "Butler".to_string(),
+        country: "US".to_string(),
+    },
+)
+.await?;
+assert_eq!(inserted, 1);
+
+let authors = db::authors::authors(&conn).await?;
+for author in authors {
+    println!("{} {} ({})", author.first_name, author.last_name, author.country);
+}
+```
+
 Use an explicit cardinality only when the default is not the shape you want, such as `INSERT ... RETURNING ...`:
 
 ```sql
@@ -67,7 +87,7 @@ cargo run -p queryforge-build-rs-example
 cargo check -p queryforge-build-rs-example
 ```
 
-The build script calls `queryforge-build`, emits Cargo rebuild hints, includes generated code from `OUT_DIR/queryforge`, and the binary executes generated native libSQL functions against an in-memory database.
+The build script calls `queryforge-build`, emits Cargo rebuild hints, includes generated code from `OUT_DIR/queryforge`, and the binary executes generated native libSQL functions against an in-memory database using generated `*Params` structs.
 
 ### `examples/usage-app`
 
@@ -78,7 +98,7 @@ cargo run -p queryforge-usage-app
 cargo test -p queryforge-usage-app
 ```
 
-The binary creates an in-memory libSQL database and calls generated functions. The test also exercises generated functions with both a connection and a transaction.
+The binary creates an in-memory libSQL database and calls generated functions with named params structs. The test also exercises generated functions with both a connection and a transaction.
 
 ### `examples/crud`
 
@@ -89,11 +109,11 @@ cargo run -p queryforge-crud-example
 cargo test -p queryforge-crud-example
 ```
 
-The binary and test create an in-memory libSQL database and exercise generated create, read, update, upsert, list, and delete functions.
+The binary and test create an in-memory libSQL database and exercise generated create, read, update, upsert, list, and delete functions. Parameterized generated functions take named `*Params` structs, so mutation calls use field names instead of positional arguments.
 
 ### `examples/sqlite-e2e`
 
-Runnable SQLx SQLite e2e example. It generates SQLx SQLite functions in `build.rs`, creates an in-memory SQLite database at runtime, and executes generated functions against a pool and a transaction.
+Runnable SQLx SQLite e2e example. It generates SQLx SQLite functions in `build.rs`, creates an in-memory SQLite database at runtime, and executes generated functions with named params structs against a pool and a transaction.
 
 ```bash
 cargo run -p queryforge-sqlite-e2e-example
@@ -122,7 +142,7 @@ Then run the example from another terminal:
 cargo run --manifest-path examples/postgres-e2e/Cargo.toml
 ```
 
-The build script creates the schema, QueryForge introspects it through `tokio-postgres`, and the binary executes generated SQLx Postgres functions against a pool and transaction.
+The build script creates the schema, QueryForge introspects it through `tokio-postgres`, and the binary executes generated SQLx Postgres functions with named params structs against a pool and transaction.
 
 ### `examples/type-mapping-profiles`
 
@@ -198,11 +218,27 @@ Applications that include generated native libSQL code also need the top-level r
 queryforge = "0.1"
 ```
 
-## Generated rows and domain models
+## Generated params, rows, and domain models
 
-QueryForge generates query-specific row DTOs from the columns returned by each SQL block. For example, a `--! get_user : one` query can generate a `GetUserRow` with fields that match the selected database columns. These generated rows are API boundary types, not ORM models: they do not own persistence behavior, relations, validation, or business methods.
+QueryForge generates query-specific parameter DTOs from named SQL params and row DTOs from returned columns. For example, a `--! get_user : one` query with `WHERE id = :id` generates `GetUserParams`, while the selected columns generate `GetUserRow`.
 
-Query names drive generated API names: `--! get_user_with_org : one` generates a `get_user_with_org(...)` function and `GetUserWithOrgRow` row type in the module derived from the SQL file name. Join queries can select duplicate column names; QueryForge keeps generated Rust valid by suffixing duplicate field identifiers (`id`, `id_2`, etc.) and decoding rows by column position. Prefer explicit SQL aliases such as `u.id AS user_id` and `o.id AS org_id` when you want stable semantic field names.
+Parameterized generated functions take the params struct instead of positional arguments:
+
+```rust
+let user = db::users::get_user(
+    &conn,
+    db::users::GetUserParams {
+        id: 42,
+    },
+)
+.await?;
+```
+
+This makes call sites easier to read, gives IDEs concrete field names to autocomplete, and prevents same-type positional argument swaps.
+
+Generated rows are API boundary types, not ORM models: they do not own persistence behavior, relations, validation, or business methods.
+
+Query names drive generated API names: `--! get_user_with_org : one` generates a `get_user_with_org(...)` function, `GetUserWithOrgParams` when params exist, and `GetUserWithOrgRow` row type in the module derived from the SQL file name. Join queries can select duplicate column names; QueryForge keeps generated Rust valid by suffixing duplicate field identifiers (`id`, `id_2`, etc.) and decoding rows by column position. Prefer explicit SQL aliases such as `u.id AS user_id` and `o.id AS org_id` when you want stable semantic field names.
 
 Keep domain models in application code and convert from generated rows:
 
@@ -231,24 +267,32 @@ For infallible mappings, implement `From<GetUserRow>` instead. This keeps genera
 Generated SQLx functions accept `sqlx::Executor`, so the same function works with pools, connections, and transactions:
 
 ```rust
-db::users::get_user(&pool, id).await?;
+db::users::get_user(&pool, db::users::GetUserParams { id }).await?;
 
 let mut tx = pool.begin().await?;
-db::users::get_user(&mut *tx, id).await?;
+db::users::get_user(&mut *tx, db::users::GetUserParams { id }).await?;
 tx.commit().await?;
 ```
 
 Generated tokio-postgres functions accept `tokio_postgres::GenericClient`, which is implemented by both `Client` and `Transaction`:
 
 ```rust
-db::users::get_user(&client, id).await?;
+db::users::get_user(&client, db::users::GetUserParams { id }).await?;
 
 let tx = client.transaction().await?;
-db::users::get_user(&tx, id).await?;
+db::users::get_user(&tx, db::users::GetUserParams { id }).await?;
 tx.commit().await?;
 ```
 
 Native libSQL generated functions use a `queryforge::runtime::libsql_executor::LibsqlExecutor` bound. With the `libsql-runtime` feature enabled, QueryForge implements that trait for `libsql::Connection` and `libsql::Transaction`, so the same generated functions can run inside or outside transactions.
+
+```rust
+db::users::get_user(&conn, db::users::GetUserParams { id }).await?;
+
+let tx = conn.transaction().await?;
+db::users::get_user(&tx, db::users::GetUserParams { id }).await?;
+tx.commit().await?;
+```
 
 ## Features
 

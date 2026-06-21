@@ -7,6 +7,10 @@ pub fn get_user_sql() -> &'static str {
     GET_USER_SQL
 }
 #[derive(Debug, Clone)]
+pub struct GetUserParams {
+    pub id: i64,
+}
+#[derive(Debug, Clone)]
 pub struct GetUserRow {
     pub id: i64,
     pub email: String,
@@ -24,12 +28,17 @@ impl TryFrom<queryforge::runtime::libsql_executor::LibsqlRow> for GetUserRow {
         })
     }
 }
-pub async fn get_user<E>(executor: &E, id: i64) -> queryforge::Result<GetUserRow>
+pub async fn get_user<E>(
+    executor: &E,
+    params: GetUserParams,
+) -> queryforge::Result<GetUserRow>
 where
     E: queryforge::runtime::libsql_executor::LibsqlExecutor + ?Sized,
 {
-    let params = vec![queryforge::runtime::libsql_executor::LibsqlValue::from(id)];
-    let row = executor.query_one(GET_USER_SQL, &params).await?;
+    let query_params = vec![
+        queryforge::runtime::libsql_executor::LibsqlValue::from(params.id)
+    ];
+    let row = executor.query_one(GET_USER_SQL, &query_params).await?;
     GetUserRow::try_from(row)
 }
 
@@ -61,9 +70,9 @@ pub async fn list_users<E>(executor: &E) -> queryforge::Result<Vec<ListUsersRow>
 where
     E: queryforge::runtime::libsql_executor::LibsqlExecutor + ?Sized,
 {
-    let params: Vec<queryforge::runtime::libsql_executor::LibsqlValue> = Vec::new();
+    let query_params: Vec<queryforge::runtime::libsql_executor::LibsqlValue> = Vec::new();
     executor
-        .query_many(LIST_USERS_SQL, &params)
+        .query_many(LIST_USERS_SQL, &query_params)
         .await?
         .into_iter()
         .map(ListUsersRow::try_from)

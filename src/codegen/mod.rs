@@ -175,6 +175,56 @@ pub(crate) struct RenderedColumn {
     pub index: Index,
 }
 
+pub(crate) struct RenderedParam {
+    pub field: Ident,
+    pub ty: Type,
+}
+
+pub(crate) fn params_ident(query: &crate::ir::QueryShape) -> Ident {
+    pascal_ident(&format!("{}_params", query.name))
+}
+
+pub(crate) fn rendered_params(query: &crate::ir::QueryShape) -> Vec<RenderedParam> {
+    query
+        .params
+        .iter()
+        .map(|param| RenderedParam {
+            field: snake_ident(&param.name),
+            ty: parse_type(&param.rust_type.0),
+        })
+        .collect()
+}
+
+pub(crate) fn render_params_struct(query: &crate::ir::QueryShape) -> TokenStream {
+    if query.params.is_empty() {
+        return TokenStream::new();
+    }
+
+    let name = params_ident(query);
+    let params = rendered_params(query);
+    let fields = params.iter().map(|param| {
+        let field = &param.field;
+        let ty = &param.ty;
+        quote! { pub #field: #ty }
+    });
+
+    quote! {
+        #[derive(Debug, Clone)]
+        pub struct #name {
+            #( #fields, )*
+        }
+    }
+}
+
+pub(crate) fn params_arg(query: &crate::ir::QueryShape) -> TokenStream {
+    if query.params.is_empty() {
+        return TokenStream::new();
+    }
+
+    let name = params_ident(query);
+    quote! { , params: #name }
+}
+
 pub(crate) fn rendered_columns(query: &crate::ir::QueryShape) -> Vec<RenderedColumn> {
     let mut seen = BTreeMap::<String, usize>::new();
     query
@@ -296,6 +346,10 @@ mod tests {
                 "    GET_USER_SQL\n",
                 "}\n",
                 "#[derive(Debug, Clone)]\n",
+                "pub struct GetUserParams {\n",
+                "    pub id: i64,\n",
+                "}\n",
+                "#[derive(Debug, Clone)]\n",
                 "pub struct GetUserRow {\n",
                 "    pub id: i64,\n",
                 "    pub email: String,\n",
@@ -311,12 +365,17 @@ mod tests {
                 "        })\n",
                 "    }\n",
                 "}\n",
-                "pub async fn get_user<E>(executor: &E, id: i64) -> queryforge::Result<GetUserRow>\n",
+                "pub async fn get_user<E>(\n",
+                "    executor: &E,\n",
+                "    params: GetUserParams,\n",
+                ") -> queryforge::Result<GetUserRow>\n",
                 "where\n",
                 "    E: queryforge::runtime::libsql_executor::LibsqlExecutor + ?Sized,\n",
                 "{\n",
-                "    let params = vec![queryforge::runtime::libsql_executor::LibsqlValue::from(id)];\n",
-                "    let row = executor.query_one(GET_USER_SQL, &params).await?;\n",
+                "    let query_params = vec![\n",
+                "        queryforge::runtime::libsql_executor::LibsqlValue::from(params.id)\n",
+                "    ];\n",
+                "    let row = executor.query_one(GET_USER_SQL, &query_params).await?;\n",
                 "    GetUserRow::try_from(row)\n",
                 "}\n\n",
             )

@@ -21,20 +21,32 @@ async fn run() -> Result<(), sqlx::Error> {
         .await?;
     create_schema(&pool).await?;
 
-    let inserted =
-        db::users::create_user(&pool, 1, "ada@example.com".into(), "Ada".into(), true).await?;
+    let inserted = db::users::create_user(
+        &pool,
+        db::users::CreateUserParams {
+            id: 1,
+            email: "ada@example.com".into(),
+            name: "Ada".into(),
+            active: true,
+        },
+    )
+    .await?;
     println!("inserted rows: {}", inserted.rows_affected());
 
-    let user = db::users::get_user(&pool, 1).await?.expect("user exists");
+    let user = db::users::get_user(&pool, db::users::GetUserParams { id: 1 })
+        .await?
+        .expect("user exists");
     println!("loaded user: {} ({})", user.email, user.name);
 
     let mut tx = pool.begin().await?;
     db::users::update_user(
         &mut *tx,
-        "ada@queryforge.dev".into(),
-        "Ada Q.".into(),
-        false,
-        1,
+        db::users::UpdateUserParams {
+            email: "ada@queryforge.dev".into(),
+            name: "Ada Q.".into(),
+            active: false,
+            id: 1,
+        },
     )
     .await?;
     tx.commit().await?;
@@ -42,7 +54,7 @@ async fn run() -> Result<(), sqlx::Error> {
     let users = db::users::list_users(&pool).await?;
     println!("users after transaction update: {}", users.len());
 
-    let deleted = db::users::delete_user(&pool, 1).await?;
+    let deleted = db::users::delete_user(&pool, db::users::DeleteUserParams { id: 1 }).await?;
     println!("deleted rows: {}", deleted.rows_affected());
 
     Ok(())
@@ -76,25 +88,37 @@ mod tests {
                 .unwrap();
             create_schema(&pool).await.unwrap();
 
-            let inserted =
-                db::users::create_user(&pool, 1, "ada@example.com".into(), "Ada".into(), true)
-                    .await
-                    .unwrap();
+            let inserted = db::users::create_user(
+                &pool,
+                db::users::CreateUserParams {
+                    id: 1,
+                    email: "ada@example.com".into(),
+                    name: "Ada".into(),
+                    active: true,
+                },
+            )
+            .await
+            .unwrap();
             assert_eq!(inserted.rows_affected(), 1);
 
             let mut tx = pool.begin().await.unwrap();
             db::users::update_user(
                 &mut *tx,
-                "ada@queryforge.dev".into(),
-                "Ada Q.".into(),
-                false,
-                1,
+                db::users::UpdateUserParams {
+                    email: "ada@queryforge.dev".into(),
+                    name: "Ada Q.".into(),
+                    active: false,
+                    id: 1,
+                },
             )
             .await
             .unwrap();
             tx.commit().await.unwrap();
 
-            let user = db::users::get_user(&pool, 1).await.unwrap().unwrap();
+            let user = db::users::get_user(&pool, db::users::GetUserParams { id: 1 })
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(user.email, "ada@queryforge.dev");
             assert_eq!(user.name, "Ada Q.");
             assert!(!user.active);
@@ -102,9 +126,16 @@ mod tests {
             let users = db::users::list_users(&pool).await.unwrap();
             assert_eq!(users.len(), 1);
 
-            let deleted = db::users::delete_user(&pool, 1).await.unwrap();
+            let deleted = db::users::delete_user(&pool, db::users::DeleteUserParams { id: 1 })
+                .await
+                .unwrap();
             assert_eq!(deleted.rows_affected(), 1);
-            assert!(db::users::get_user(&pool, 1).await.unwrap().is_none());
+            assert!(
+                db::users::get_user(&pool, db::users::GetUserParams { id: 1 })
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 }
