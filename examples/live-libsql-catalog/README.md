@@ -29,4 +29,13 @@ execution_target = "libsql-native"
 query_dir = "queries"
 ```
 
-Remote libSQL catalog introspection is not implemented yet. For remote databases, provide `[schema].files` for offline inference.
+Remote libSQL catalog introspection is available when the generator is built with `libsql-remote` and a token is configured:
+
+```toml
+[database]
+backend = "libsql"
+url = "libsql://example.turso.io"
+auth_token_env = "LIBSQL_AUTH_TOKEN"
+```
+
+If you do not want the build to connect to a remote database, provide `[schema].files` for offline inference.

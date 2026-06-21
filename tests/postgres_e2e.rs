@@ -31,6 +31,8 @@ fn postgres_prepared_statement_metadata_e2e() {
         database: DatabaseConfig {
             backend: DatabaseBackend::Postgres,
             url,
+            auth_token: None,
+            auth_token_env: None,
         },
         codegen: CodegenConfig {
             out_dir: PathBuf::from("generated"),

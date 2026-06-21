@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::future::Future;
 
 use crate::error::{Error, Result};
@@ -159,7 +158,7 @@ where
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LibsqlRow {
-    values: BTreeMap<String, LibsqlValue>,
+    values: Vec<(String, LibsqlValue)>,
 }
 
 impl LibsqlRow {
@@ -178,8 +177,23 @@ impl LibsqlRow {
     {
         let value = self
             .values
-            .get(column)
+            .iter()
+            .find_map(|(name, value)| (name == column).then_some(value))
             .ok_or_else(|| Error::Backend(format!("libSQL row has no column `{column}`")))?;
+        T::decode(value)
+    }
+
+    pub fn try_get_index<T>(&self, index: usize) -> Result<T>
+    where
+        T: LibsqlDecode,
+    {
+        let value = self
+            .values
+            .get(index)
+            .map(|(_, value)| value)
+            .ok_or_else(|| {
+                Error::Backend(format!("libSQL row has no column at index `{index}`"))
+            })?;
         T::decode(value)
     }
 }
@@ -260,12 +274,19 @@ impl LibsqlDecode for Vec<u8> {
 #[cfg(feature = "uuid-types")]
 impl LibsqlDecode for uuid::Uuid {
     fn decode(value: &LibsqlValue) -> Result<Self> {
-        let text = decode_text("uuid::Uuid", value)?;
-        uuid::Uuid::parse_str(text).map_err(|err| {
-            Error::Backend(format!(
-                "failed to decode libSQL value as uuid::Uuid: {err}"
-            ))
-        })
+        match value {
+            LibsqlValue::Text(text) => uuid::Uuid::parse_str(text).map_err(|err| {
+                Error::Backend(format!(
+                    "failed to decode libSQL text value as uuid::Uuid: {err}"
+                ))
+            }),
+            LibsqlValue::Blob(bytes) => uuid::Uuid::from_slice(bytes).map_err(|err| {
+                Error::Backend(format!(
+                    "failed to decode libSQL blob value as uuid::Uuid: {err}"
+                ))
+            }),
+            other => Err(decode_error("uuid::Uuid", other)),
+        }
     }
 }
 
@@ -445,6 +466,12 @@ fn decode_error(expected: &str, actual: &LibsqlValue) -> Error {
     feature = "time-types",
     feature = "chrono-types",
     feature = "decimal-types"
+))]
+#[cfg(any(
+    feature = "serde-json-types",
+    feature = "decimal-types",
+    feature = "chrono-types",
+    feature = "time-types"
 ))]
 fn decode_text<'a>(expected: &str, value: &'a LibsqlValue) -> Result<&'a str> {
     match value {
@@ -701,6 +728,18 @@ mod tests {
     }
 
     #[test]
+    fn preserves_duplicate_column_names_for_index_decoding() {
+        let row = LibsqlRow::new([
+            ("id", LibsqlValue::Integer(1)),
+            ("id", LibsqlValue::Integer(2)),
+        ]);
+
+        assert_eq!(row.try_get::<i64>("id").unwrap(), 1);
+        assert_eq!(row.try_get_index::<i64>(0).unwrap(), 1);
+        assert_eq!(row.try_get_index::<i64>(1).unwrap(), 2);
+    }
+
+    #[test]
     fn converts_params_into_runtime_values() {
         assert_eq!(LibsqlValue::from(1_i64), LibsqlValue::Integer(1));
         assert_eq!(
@@ -727,6 +766,7 @@ mod tests {
 
         let row = LibsqlRow::new([
             ("id", LibsqlValue::from(id)),
+            ("id_blob", LibsqlValue::Blob(id.as_bytes().to_vec())),
             ("payload", LibsqlValue::from(payload.clone())),
             ("amount", LibsqlValue::from(amount)),
             ("time_value", LibsqlValue::from(time_value)),
@@ -734,6 +774,7 @@ mod tests {
         ]);
 
         assert_eq!(row.try_get::<uuid::Uuid>("id").unwrap(), id);
+        assert_eq!(row.try_get::<uuid::Uuid>("id_blob").unwrap(), id);
         assert_eq!(
             row.try_get::<serde_json::Value>("payload").unwrap(),
             payload

@@ -4,7 +4,8 @@ use quote::quote;
 use crate::ir::{Cardinality, QueryShape};
 
 use super::{
-    format_query_tokens, lit_str, parse_type, pascal_ident, rust_type, snake_ident, upper_ident,
+    format_query_tokens, lit_str, parse_type, pascal_ident, rendered_columns, snake_ident,
+    upper_ident,
 };
 
 pub fn render_query(query: &QueryShape) -> String {
@@ -90,15 +91,16 @@ fn render_row_struct(query: &QueryShape, row_name: &proc_macro2::Ident) -> Token
         return TokenStream::new();
     }
 
-    let fields = query.columns.iter().map(|column| {
-        let field = snake_ident(&column.rust_name);
-        let ty = rust_type(&column.rust_type.0, &column.nullable);
+    let columns = rendered_columns(query);
+    let fields = columns.iter().map(|column| {
+        let field = &column.field;
+        let ty = &column.ty;
         quote! { pub #field: #ty }
     });
-    let getters = query.columns.iter().map(|column| {
-        let field = snake_ident(&column.rust_name);
-        let name = lit_str(&column.name);
-        quote! { #field: row.try_get(#name)? }
+    let getters = columns.iter().map(|column| {
+        let field = &column.field;
+        let index = &column.index;
+        quote! { #field: row.try_get(#index)? }
     });
 
     quote! {
@@ -164,7 +166,7 @@ mod tests {
         assert!(rendered
             .contains("let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&id];"));
         assert!(rendered.contains("client.query_one(GET_USER_SQL, params).await?"));
-        assert!(rendered.contains("email: row.try_get(\"email\")?"));
+        assert!(rendered.contains("email: row.try_get(1)?"));
     }
 
     #[test]
@@ -220,8 +222,8 @@ mod tests {
                 "    type Error = tokio_postgres::Error;\n",
                 "    fn try_from(row: tokio_postgres::Row) -> Result<Self, Self::Error> {\n",
                 "        Ok(Self {\n",
-                "            id: row.try_get(\"id\")?,\n",
-                "            email: row.try_get(\"email\")?,\n",
+                "            id: row.try_get(0)?,\n",
+                "            email: row.try_get(1)?,\n",
                 "        })\n",
                 "    }\n",
                 "}\n",

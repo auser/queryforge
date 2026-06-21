@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::config::Config;
+use crate::config::{Config, TypeMappingConfig, UuidTypeMapping};
 use crate::error::{Error, Result};
 use crate::fingerprint::{Fingerprint, QUERYFORGE_CODEGEN_VERSION};
 use crate::ir::{
@@ -65,7 +65,7 @@ fn shape_query(
     q: ParsedQuery,
 ) -> Result<QueryShape> {
     let normalized = normalize_named_params(&q.original_sql, "?");
-    let query_analysis = analyze_query(&q.original_sql, catalog)?;
+    let query_analysis = analyze_query(&q.original_sql, catalog, &config.type_mapping)?;
     let params = normalized
         .param_names
         .into_iter()
@@ -177,17 +177,42 @@ impl SchemaCatalog {
 
     #[cfg(feature = "libsql-runtime")]
     fn load_live_or_fallback(config: &Config) -> Result<Option<Self>> {
-        let Some(path) = local_libsql_path(&config.database.url) else {
-            if config.schema.files.is_empty() && is_remote_libsql_url(&config.database.url) {
-                return Err(Error::Unsupported(format!(
-                    "live libSQL catalog introspection for remote URL `{}` is not supported yet; provide [schema].files for offline schema inference",
-                    config.database.url
-                )));
+        let catalog = if let Some(path) = local_libsql_path(&config.database.url) {
+            load_live_catalog(path.to_string(), &config.type_mapping)
+        } else if is_remote_libsql_url(&config.database.url) {
+            #[cfg(feature = "libsql-remote")]
+            {
+                let Some(auth_token) = libsql_auth_token(config)? else {
+                    if config.schema.files.is_empty() {
+                        return Err(Error::Config(format!(
+                            "remote libSQL catalog introspection for `{}` requires [database].auth_token or [database].auth_token_env; provide [schema].files for offline inference if remote introspection is not desired",
+                            config.database.url
+                        )));
+                    }
+                    return Ok(None);
+                };
+                load_remote_live_catalog(
+                    config.database.url.clone(),
+                    auth_token,
+                    &config.type_mapping,
+                )
             }
+
+            #[cfg(not(feature = "libsql-remote"))]
+            {
+                if config.schema.files.is_empty() {
+                    return Err(Error::Unsupported(format!(
+                        "remote libSQL catalog introspection for `{}` requires enabling the QueryForge `libsql-remote` feature; provide [schema].files for offline inference if remote introspection is not desired",
+                        config.database.url
+                    )));
+                }
+                return Ok(None);
+            }
+        } else {
             return Ok(None);
         };
 
-        match load_live_catalog(path.to_string(), &config.type_mapping) {
+        match catalog {
             Ok(catalog) if !catalog.tables.is_empty() || config.schema.files.is_empty() => {
                 Ok(Some(catalog))
             }
@@ -304,61 +329,95 @@ fn load_live_catalog(
             .await
             .map_err(map_libsql_error)?;
         let conn = db.connect().map_err(map_libsql_error)?;
-
-        let mut table_rows = libsql::Connection::query(
+        load_live_catalog_from_connection(
             &conn,
-            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-            (),
+            format!("libsql-live-catalog-v0\nsource=local\npath={path}\n"),
+            &type_mapping,
         )
         .await
-        .map_err(map_libsql_error)?;
+    })
+}
 
-        let mut table_names = Vec::new();
-        while let Some(row) = table_rows.next().await.map_err(map_libsql_error)? {
-            let value = row.get_value(0).map_err(map_libsql_error)?;
-            if let Some(name) = libsql_value_to_string(value) {
-                table_names.push(name);
-            }
+#[cfg(all(feature = "libsql-runtime", feature = "libsql-remote"))]
+fn load_remote_live_catalog(
+    url: String,
+    auth_token: String,
+    type_mapping: &crate::config::TypeMappingConfig,
+) -> Result<SchemaCatalog> {
+    let type_mapping = type_mapping.clone();
+    block_on_libsql(async move {
+        let db = libsql::Builder::new_remote(url.clone(), auth_token)
+            .build()
+            .await
+            .map_err(map_libsql_error)?;
+        let conn = db.connect().map_err(map_libsql_error)?;
+        load_live_catalog_from_connection(
+            &conn,
+            format!("libsql-live-catalog-v0\nsource=remote\nurl={url}\n"),
+            &type_mapping,
+        )
+        .await
+    })
+}
+
+#[cfg(feature = "libsql-runtime")]
+async fn load_live_catalog_from_connection(
+    conn: &libsql::Connection,
+    mut fingerprint_text: String,
+    type_mapping: &crate::config::TypeMappingConfig,
+) -> Result<SchemaCatalog> {
+    let mut table_rows = libsql::Connection::query(
+        conn,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        (),
+    )
+    .await
+    .map_err(map_libsql_error)?;
+
+    let mut table_names = Vec::new();
+    while let Some(row) = table_rows.next().await.map_err(map_libsql_error)? {
+        let value = row.get_value(0).map_err(map_libsql_error)?;
+        if let Some(name) = libsql_value_to_string(value) {
+            table_names.push(name);
         }
+    }
 
-        let mut tables = BTreeMap::new();
-        let mut fingerprint_text = format!("libsql-live-catalog-v0\npath={path}\n");
-        for table_name in table_names {
-            let table = load_live_table_schema(&conn, &table_name, &type_mapping).await?;
-            fingerprint_text.push_str(&format!("table={}\n", table.name));
-            for column in table.columns.values() {
-                fingerprint_text.push_str(&format!(
-                    "column={}:{}:{:?}\n",
-                    column.name, column.declared_type, column.nullable
-                ));
-            }
-            for index in &table.indexes {
-                fingerprint_text.push_str(&format!(
-                    "index={}:{}:{}\n",
-                    index.name,
-                    index.unique,
-                    index.columns.join(",")
-                ));
-            }
-            for foreign_key in &table.foreign_keys {
-                fingerprint_text.push_str(&format!(
-                    "foreign-key={}:{}:{}:{}:{:?}:{:?}:{:?}\n",
-                    foreign_key.id,
-                    foreign_key.seq,
-                    foreign_key.from_column,
-                    foreign_key.table,
-                    foreign_key.to_column,
-                    foreign_key.on_update,
-                    foreign_key.on_delete
-                ));
-            }
-            tables.insert(normalize_ident(&table.name), table);
+    let mut tables = BTreeMap::new();
+    for table_name in table_names {
+        let table = load_live_table_schema(conn, &table_name, type_mapping).await?;
+        fingerprint_text.push_str(&format!("table={}\n", table.name));
+        for column in table.columns.values() {
+            fingerprint_text.push_str(&format!(
+                "column={}:{}:{:?}\n",
+                column.name, column.declared_type, column.nullable
+            ));
         }
+        for index in &table.indexes {
+            fingerprint_text.push_str(&format!(
+                "index={}:{}:{}\n",
+                index.name,
+                index.unique,
+                index.columns.join(",")
+            ));
+        }
+        for foreign_key in &table.foreign_keys {
+            fingerprint_text.push_str(&format!(
+                "foreign-key={}:{}:{}:{}:{:?}:{:?}:{:?}\n",
+                foreign_key.id,
+                foreign_key.seq,
+                foreign_key.from_column,
+                foreign_key.table,
+                foreign_key.to_column,
+                foreign_key.on_update,
+                foreign_key.on_delete
+            ));
+        }
+        tables.insert(normalize_ident(&table.name), table);
+    }
 
-        Ok(SchemaCatalog {
-            tables,
-            fingerprint: Fingerprint::from_text(&fingerprint_text),
-        })
+    Ok(SchemaCatalog {
+        tables,
+        fingerprint: Fingerprint::from_text(&fingerprint_text),
     })
 }
 
@@ -601,6 +660,35 @@ fn is_remote_libsql_url(url: &str) -> bool {
     url.contains("://") || url.starts_with("libsql:")
 }
 
+#[cfg(all(feature = "libsql-runtime", feature = "libsql-remote"))]
+fn libsql_auth_token(config: &Config) -> Result<Option<String>> {
+    if let Some(token) = config
+        .database
+        .auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        return Ok(Some(token.to_string()));
+    }
+
+    let Some(env_name) = config
+        .database
+        .auth_token_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|env_name| !env_name.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    std::env::var(env_name).map(Some).map_err(|err| {
+        Error::Config(format!(
+            "failed to read libSQL auth token from environment variable `{env_name}`: {err}"
+        ))
+    })
+}
+
 #[cfg(feature = "libsql-runtime")]
 fn quote_sqlite_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
@@ -630,22 +718,30 @@ fn map_libsql_error(error: libsql::Error) -> Error {
     Error::Backend(format!("libSQL error: {error}"))
 }
 
-fn analyze_query(sql: &str, catalog: &SchemaCatalog) -> Result<QueryAnalysis> {
+fn analyze_query(
+    sql: &str,
+    catalog: &SchemaCatalog,
+    type_mapping: &TypeMappingConfig,
+) -> Result<QueryAnalysis> {
     if sql_ir::parse_select(sql).is_some() {
-        return analyze_select(sql, catalog);
+        return analyze_select(sql, catalog, type_mapping);
     }
 
     analyze_mutation(sql, catalog)
 }
 
-fn analyze_select(sql: &str, catalog: &SchemaCatalog) -> Result<QueryAnalysis> {
+fn analyze_select(
+    sql: &str,
+    catalog: &SchemaCatalog,
+    type_mapping: &TypeMappingConfig,
+) -> Result<QueryAnalysis> {
     let Some(select) = sql_ir::parse_select(sql) else {
         return Ok(QueryAnalysis::default());
     };
 
-    let catalog = catalog_with_query_relations(catalog, &select)?;
+    let catalog = catalog_with_query_relations(catalog, &select, type_mapping)?;
     let resolved_tables = resolve_tables(&select, &catalog);
-    if resolved_tables.is_empty() {
+    if resolved_tables.is_empty() && !select.table_refs.is_empty() {
         return Ok(QueryAnalysis {
             dependencies: QueryDependencies {
                 tables: select
@@ -670,13 +766,13 @@ fn analyze_select(sql: &str, catalog: &SchemaCatalog) -> Result<QueryAnalysis> {
         ..QueryAnalysis::default()
     };
     let (nested_param_types, nested_param_db_types) =
-        query_relation_param_types(&catalog, &select)?;
+        query_relation_param_types(&catalog, &select, type_mapping)?;
     analysis.param_types.extend(nested_param_types);
     analysis.param_db_types.extend(nested_param_db_types);
-    merge_compound_analysis(&catalog, &select, &mut analysis)?;
+    merge_compound_analysis(&catalog, &select, &mut analysis, type_mapping)?;
 
     for projection in select.projections {
-        infer_projection(&projection, &resolved_tables, &mut analysis);
+        infer_projection(&projection, &resolved_tables, &mut analysis, type_mapping);
     }
     infer_param_types(
         sql,
@@ -690,89 +786,48 @@ fn analyze_select(sql: &str, catalog: &SchemaCatalog) -> Result<QueryAnalysis> {
 
 fn analyze_mutation(sql: &str, catalog: &SchemaCatalog) -> Result<QueryAnalysis> {
     let mut analysis = QueryAnalysis::default();
-    let Some(table_name) = mutation_table_name(sql) else {
-        return Ok(analysis);
-    };
-    analysis.dependencies.tables.push_unique(&table_name);
-    let Some(table) = catalog.tables.get(&normalize_ident(&table_name)) else {
-        return Ok(analysis);
-    };
+    if let Some(mutation) = sql_ir::parse_mutation(sql) {
+        analysis.dependencies.tables.push_unique(&mutation.table);
+        let Some(table) = catalog.tables.get(&normalize_ident(&mutation.table)) else {
+            return Ok(analysis);
+        };
 
-    infer_param_types_by_name(sql, table, &mut analysis);
-    infer_insert_param_types(sql, table, &mut analysis);
-    infer_update_param_types(sql, table, &mut analysis);
+        infer_param_types_by_name(sql, table, &mut analysis);
+        infer_mutation_column_param_types(&mutation.column_params, table, &mut analysis);
+        infer_mutation_equality_param_types(&mutation.equality_params, table, &mut analysis);
+        return Ok(analysis);
+    }
 
     Ok(analysis)
 }
 
-fn mutation_table_name(sql: &str) -> Option<String> {
-    let trimmed = trim_sql_for_mutation(sql);
-    let words = mutation_words(trimmed);
-    match words.first().map(|word| word.as_str()) {
-        Some("insert") => words
-            .windows(2)
-            .find(|window| window[0] == "into")
-            .map(|window| window[1].clone()),
-        Some("update") => words.get(1).cloned(),
-        Some("delete") => words
-            .windows(2)
-            .find(|window| window[0] == "from")
-            .map(|window| window[1].clone()),
-        _ => None,
+fn infer_mutation_column_param_types(
+    column_params: &[sql_ir::MutationColumnParam],
+    table: &TableSchema,
+    analysis: &mut QueryAnalysis,
+) {
+    for column_param in column_params {
+        if let Some(column) = table.columns.get(&normalize_ident(&column_param.column)) {
+            insert_param_type(&column_param.param, column, analysis);
+        }
+    }
+}
+
+fn infer_mutation_equality_param_types(
+    equality_params: &[sql_ir::EqualityParam],
+    table: &TableSchema,
+    analysis: &mut QueryAnalysis,
+) {
+    for equality in equality_params {
+        if let Some(column) = table.columns.get(&normalize_ident(&equality.column)) {
+            insert_param_type(&equality.param, column, analysis);
+        }
     }
 }
 
 fn infer_param_types_by_name(sql: &str, table: &TableSchema, analysis: &mut QueryAnalysis) {
     for param in normalize_named_params(sql, "?").param_names {
         if let Some(column) = table.columns.get(&normalize_ident(&param)) {
-            insert_param_type(&param, column, analysis);
-        }
-    }
-}
-
-fn infer_insert_param_types(sql: &str, table: &TableSchema, analysis: &mut QueryAnalysis) {
-    let Some((columns, values)) = insert_columns_and_values(sql) else {
-        return;
-    };
-
-    for (column, value) in columns.iter().zip(values.iter()) {
-        let Some(param) = value.trim().strip_prefix(':') else {
-            continue;
-        };
-        let param = param
-            .chars()
-            .take_while(|ch| *ch == '_' || ch.is_ascii_alphanumeric())
-            .collect::<String>();
-        if param.is_empty() {
-            continue;
-        }
-        if let Some(column) = table.columns.get(&normalize_ident(column)) {
-            insert_param_type(&param, column, analysis);
-        }
-    }
-}
-
-fn infer_update_param_types(sql: &str, table: &TableSchema, analysis: &mut QueryAnalysis) {
-    let Some(assignments) = update_assignments(sql) else {
-        return;
-    };
-
-    for assignment in split_top_level_commas(assignments) {
-        let Some((column, value)) = assignment.split_once('=') else {
-            continue;
-        };
-        let Some(param) = value.trim().strip_prefix(':') else {
-            continue;
-        };
-        let param = param
-            .chars()
-            .take_while(|ch| *ch == '_' || ch.is_ascii_alphanumeric())
-            .collect::<String>();
-        if param.is_empty() {
-            continue;
-        }
-        let (_, column) = sql_ir::split_qualified_name(column.trim());
-        if let Some(column) = table.columns.get(&normalize_ident(&column)) {
             insert_param_type(&param, column, analysis);
         }
     }
@@ -786,66 +841,6 @@ fn insert_param_type(param: &str, column: &ColumnSchema, analysis: &mut QueryAna
         param.to_string(),
         Some(format!("sqlite:{}", column.declared_type)),
     );
-}
-
-fn insert_columns_and_values(sql: &str) -> Option<(Vec<String>, Vec<String>)> {
-    let lower = sql.to_ascii_lowercase();
-    let into_idx = lower.find("into")?;
-    let after_into = &sql[into_idx + "into".len()..];
-    let columns_open = after_into.find('(')?;
-    let columns_open = into_idx + "into".len() + columns_open;
-    let columns_close = find_matching_simple_paren(sql, columns_open)?;
-    let values_idx = lower[columns_close..].find("values")? + columns_close;
-    let after_values = &sql[values_idx + "values".len()..];
-    let values_open = after_values.find('(')?;
-    let values_open = values_idx + "values".len() + values_open;
-    let values_close = find_matching_simple_paren(sql, values_open)?;
-
-    let columns = split_top_level_commas(&sql[columns_open + 1..columns_close]);
-    let values = split_top_level_commas(&sql[values_open + 1..values_close]);
-    Some((columns, values))
-}
-
-fn update_assignments(sql: &str) -> Option<&str> {
-    let lower = sql.to_ascii_lowercase();
-    let set_idx = lower.find(" set ")? + " set ".len();
-    let where_idx = lower[set_idx..]
-        .find(" where ")
-        .map(|idx| set_idx + idx)
-        .unwrap_or(sql.len());
-    Some(sql[set_idx..where_idx].trim())
-}
-
-fn split_top_level_commas(input: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut depth = 0usize;
-    let bytes = input.as_bytes();
-    let mut idx = 0;
-
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'\'' => skip_single_quoted_bytes(bytes, &mut idx),
-            b'"' => skip_double_quoted_bytes(bytes, &mut idx),
-            b'(' => {
-                depth += 1;
-                idx += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                idx += 1;
-            }
-            b',' if depth == 0 => {
-                parts.push(input[start..idx].trim().to_string());
-                idx += 1;
-                start = idx;
-            }
-            _ => idx += 1,
-        }
-    }
-
-    parts.push(input[start..].trim().to_string());
-    parts.into_iter().filter(|part| !part.is_empty()).collect()
 }
 
 fn find_matching_simple_paren(input: &str, open: usize) -> Option<usize> {
@@ -906,30 +901,14 @@ fn skip_double_quoted_bytes(bytes: &[u8], idx: &mut usize) {
     }
 }
 
-fn trim_sql_for_mutation(sql: &str) -> &str {
-    sql.trim()
-        .trim_end_matches(';')
-        .trim_start_matches('\u{feff}')
-        .trim()
-}
-
-fn mutation_words(sql: &str) -> Vec<String> {
-    sql.split(|ch: char| ch.is_ascii_whitespace() || matches!(ch, '(' | ')' | ',' | ';'))
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let (_, name) = sql_ir::split_qualified_name(part);
-            normalize_ident(&name)
-        })
-        .collect()
-}
-
 fn merge_compound_analysis(
     catalog: &SchemaCatalog,
     select: &sql_ir::SelectStatement,
     analysis: &mut QueryAnalysis,
+    type_mapping: &TypeMappingConfig,
 ) -> Result<()> {
     for compound in &select.compound {
-        let branch = analyze_select(&compound.query, catalog)?;
+        let branch = analyze_select(&compound.query, catalog, type_mapping)?;
         for table in branch.dependencies.tables {
             analysis.dependencies.tables.push_unique(&table);
         }
@@ -946,12 +925,13 @@ fn merge_compound_analysis(
 fn query_relation_param_types(
     catalog: &SchemaCatalog,
     select: &sql_ir::SelectStatement,
+    type_mapping: &TypeMappingConfig,
 ) -> Result<(BTreeMap<String, RustType>, BTreeMap<String, Option<String>>)> {
     let mut param_types = BTreeMap::new();
     let mut param_db_types = BTreeMap::new();
 
     for cte in &select.ctes {
-        let analysis = analyze_select(&cte.query, catalog)?;
+        let analysis = analyze_select(&cte.query, catalog, type_mapping)?;
         param_types.extend(analysis.param_types);
         param_db_types.extend(analysis.param_db_types);
     }
@@ -960,7 +940,7 @@ fn query_relation_param_types(
         let Some(query) = &table_ref.derived_query else {
             continue;
         };
-        let analysis = analyze_select(query, catalog)?;
+        let analysis = analyze_select(query, catalog, type_mapping)?;
         param_types.extend(analysis.param_types);
         param_db_types.extend(analysis.param_db_types);
     }
@@ -971,12 +951,13 @@ fn query_relation_param_types(
 fn catalog_with_query_relations(
     catalog: &SchemaCatalog,
     select: &sql_ir::SelectStatement,
+    type_mapping: &TypeMappingConfig,
 ) -> Result<SchemaCatalog> {
     let mut catalog = catalog.clone();
 
     for cte in &select.ctes {
         if let Some(table) =
-            table_schema_from_select(&cte.name, &cte.query, &cte.columns, &catalog)?
+            table_schema_from_select(&cte.name, &cte.query, &cte.columns, &catalog, type_mapping)?
         {
             catalog.tables.insert(normalize_ident(&cte.name), table);
         }
@@ -986,7 +967,9 @@ fn catalog_with_query_relations(
         let Some(query) = &table_ref.derived_query else {
             continue;
         };
-        if let Some(table) = table_schema_from_select(&table_ref.name, query, &[], &catalog)? {
+        if let Some(table) =
+            table_schema_from_select(&table_ref.name, query, &[], &catalog, type_mapping)?
+        {
             catalog
                 .tables
                 .insert(normalize_ident(&table_ref.name), table);
@@ -1001,8 +984,9 @@ fn table_schema_from_select(
     sql: &str,
     declared_names: &[String],
     catalog: &SchemaCatalog,
+    type_mapping: &TypeMappingConfig,
 ) -> Result<Option<TableSchema>> {
-    let analysis = analyze_select(sql, catalog)?;
+    let analysis = analyze_select(sql, catalog, type_mapping)?;
     if analysis.columns.is_empty() {
         return Ok(None);
     }
@@ -1072,6 +1056,7 @@ fn infer_projection(
     projection: &SelectProjection,
     tables: &[ResolvedTable<'_>],
     analysis: &mut QueryAnalysis,
+    type_mapping: &TypeMappingConfig,
 ) {
     let expr = projection.expr.trim();
     if expr == "*" {
@@ -1105,7 +1090,7 @@ fn infer_projection(
         return;
     }
 
-    if let Some(column) = infer_builtin_expression(expr, alias, tables, analysis) {
+    if let Some(column) = infer_builtin_expression(expr, alias, tables, analysis, type_mapping) {
         analysis.columns.push(column);
     } else if let Some(alias) = alias {
         analysis.columns.push(QueryColumn {
@@ -1125,6 +1110,7 @@ fn infer_builtin_expression(
     alias: Option<&str>,
     tables: &[ResolvedTable<'_>],
     analysis: &mut QueryAnalysis,
+    type_mapping: &TypeMappingConfig,
 ) -> Option<QueryColumn> {
     let lower = expr.trim().to_ascii_lowercase();
     if lower == "count(*)" {
@@ -1140,8 +1126,76 @@ fn infer_builtin_expression(
         });
     }
 
-    if let Some(args) = function_args(expr, "coalesce") {
-        analysis.dependencies.functions.push_unique("coalesce");
+    if matches!(
+        lower.as_str(),
+        "uuid()" | "uuid4()" | "uuid7()" | "gen_random_uuid()"
+    ) {
+        let function = lower
+            .strip_suffix("()")
+            .unwrap_or(lower.as_str())
+            .to_string();
+        analysis.dependencies.functions.push_unique(&function);
+        return Some(QueryColumn {
+            name: alias.unwrap_or(expr).to_string(),
+            rust_name: to_snake_case(alias.unwrap_or(expr)),
+            db_type: Some("sqlite:UUID".to_string()),
+            rust_type: uuid_rust_type(type_mapping),
+            nullable: Nullability::NonNull,
+            source: TypeSource::BuiltinFunctionRule,
+            confidence: InferenceConfidence::Strong,
+        });
+    }
+
+    if let Some(args) = function_args(expr, "uuid_str") {
+        analysis.dependencies.functions.push_unique("uuid_str");
+        return Some(QueryColumn {
+            name: alias.unwrap_or(expr).to_string(),
+            rust_name: to_snake_case(alias.unwrap_or(expr)),
+            db_type: Some("sqlite:UUID".to_string()),
+            rust_type: uuid_rust_type(type_mapping),
+            nullable: expression_nullability(&args, tables),
+            source: TypeSource::BuiltinFunctionRule,
+            confidence: InferenceConfidence::Strong,
+        });
+    }
+
+    if let Some(args) = function_args(expr, "uuid_blob") {
+        analysis.dependencies.functions.push_unique("uuid_blob");
+        return Some(QueryColumn {
+            name: alias.unwrap_or(expr).to_string(),
+            rust_name: to_snake_case(alias.unwrap_or(expr)),
+            db_type: Some("sqlite:BLOB".to_string()),
+            rust_type: uuid_rust_type(type_mapping),
+            nullable: expression_nullability(&args, tables),
+            source: TypeSource::BuiltinFunctionRule,
+            confidence: InferenceConfidence::Strong,
+        });
+    }
+
+    if function_args(expr, "uuid7_timestamp_ms").is_some() {
+        analysis
+            .dependencies
+            .functions
+            .push_unique("uuid7_timestamp_ms");
+        return Some(QueryColumn {
+            name: alias.unwrap_or(expr).to_string(),
+            rust_name: to_snake_case(alias.unwrap_or(expr)),
+            db_type: Some("sqlite:INTEGER".to_string()),
+            rust_type: RustType::new("i64"),
+            nullable: Nullability::Nullable,
+            source: TypeSource::BuiltinFunctionRule,
+            confidence: InferenceConfidence::Strong,
+        });
+    }
+
+    for coalesce_function in ["coalesce", "ifnull"] {
+        let Some(args) = function_args(expr, coalesce_function) else {
+            continue;
+        };
+        analysis
+            .dependencies
+            .functions
+            .push_unique(coalesce_function);
         let (rust_type, db_type) = expression_type(&args, tables)
             .unwrap_or_else(|| (RustType::string(), Some("sqlite:TEXT".to_string())));
         return Some(QueryColumn {
@@ -1150,6 +1204,19 @@ fn infer_builtin_expression(
             db_type,
             rust_type,
             nullable: coalesce_expression_nullability(&args, tables),
+            source: TypeSource::BuiltinFunctionRule,
+            confidence: InferenceConfidence::Strong,
+        });
+    }
+
+    if let Some(args) = function_args(expr, "length") {
+        analysis.dependencies.functions.push_unique("length");
+        return Some(QueryColumn {
+            name: alias.unwrap_or(expr).to_string(),
+            rust_name: to_snake_case(alias.unwrap_or(expr)),
+            db_type: Some("sqlite:INTEGER".to_string()),
+            rust_type: RustType::new("i64"),
+            nullable: expression_nullability(&args, tables),
             source: TypeSource::BuiltinFunctionRule,
             confidence: InferenceConfidence::Strong,
         });
@@ -1187,6 +1254,14 @@ fn infer_builtin_expression(
     }
 
     None
+}
+
+fn uuid_rust_type(type_mapping: &TypeMappingConfig) -> RustType {
+    if type_mapping.uuid == UuidTypeMapping::Uuid {
+        RustType::new("uuid::Uuid")
+    } else {
+        RustType::string()
+    }
 }
 
 fn function_args<'a>(expr: &'a str, expected_name: &str) -> Option<Vec<&'a str>> {
@@ -1699,7 +1774,7 @@ mod tests {
                 name: "rename_user".to_string(),
                 source_file: PathBuf::from("queries/users.sql"),
                 original_sql:
-                    "UPDATE users SET email = :new_email, active = :active WHERE id = :id"
+                    "UPDATE users SET email = :new_email, active = :is_active WHERE id = :user_id"
                         .to_string(),
                 cardinality: Cardinality::Exec,
             },
@@ -1707,9 +1782,9 @@ mod tests {
         .unwrap();
         assert_eq!(update.params[0].name, "new_email");
         assert_eq!(update.params[0].rust_type.0, "String");
-        assert_eq!(update.params[1].name, "active");
+        assert_eq!(update.params[1].name, "is_active");
         assert_eq!(update.params[1].rust_type.0, "bool");
-        assert_eq!(update.params[2].name, "id");
+        assert_eq!(update.params[2].name, "user_id");
         assert_eq!(update.params[2].rust_type.0, "i64");
 
         let delete = shape_query(
@@ -1721,12 +1796,12 @@ mod tests {
             ParsedQuery {
                 name: "delete_user".to_string(),
                 source_file: PathBuf::from("queries/users.sql"),
-                original_sql: "DELETE FROM users WHERE id = :id".to_string(),
+                original_sql: "DELETE FROM users WHERE id = :user_id".to_string(),
                 cardinality: Cardinality::Exec,
             },
         )
         .unwrap();
-        assert_eq!(delete.params[0].name, "id");
+        assert_eq!(delete.params[0].name, "user_id");
         assert_eq!(delete.params[0].rust_type.0, "i64");
     }
 
@@ -1737,7 +1812,7 @@ mod tests {
         let query = ParsedQuery {
             name: "list_users".to_string(),
             source_file: PathBuf::from("queries/users.sql"),
-            original_sql: "SELECT *, count(*) AS total, lower(email) AS lower_email, email || '' AS email_expr, coalesce(parent_id, 0) AS parent_fallback FROM users".to_string(),
+            original_sql: "SELECT *, count(*) AS total, lower(email) AS lower_email, email || '' AS email_expr, coalesce(parent_id, 0) AS parent_fallback, ifnull(parent_id, 0) AS parent_ifnull, length(email) AS email_len, length(parent_id) AS parent_len FROM users".to_string(),
             cardinality: Cardinality::Many,
         };
 
@@ -1784,9 +1859,101 @@ mod tests {
         assert_eq!(parent_fallback.rust_type.0, "i64");
         assert_eq!(parent_fallback.nullable, Nullability::NonNull);
         assert_eq!(parent_fallback.source, TypeSource::BuiltinFunctionRule);
+        let parent_ifnull = shaped
+            .columns
+            .iter()
+            .find(|column| column.name == "parent_ifnull")
+            .unwrap();
+        assert_eq!(parent_ifnull.rust_type.0, "i64");
+        assert_eq!(parent_ifnull.nullable, Nullability::NonNull);
+        assert_eq!(parent_ifnull.source, TypeSource::BuiltinFunctionRule);
+        let email_len = shaped
+            .columns
+            .iter()
+            .find(|column| column.name == "email_len")
+            .unwrap();
+        assert_eq!(email_len.rust_type.0, "i64");
+        assert_eq!(email_len.nullable, Nullability::NonNull);
+        let parent_len = shaped
+            .columns
+            .iter()
+            .find(|column| column.name == "parent_len")
+            .unwrap();
+        assert_eq!(parent_len.rust_type.0, "i64");
+        assert_eq!(parent_len.nullable, Nullability::Nullable);
         assert_eq!(
             shaped.dependencies.functions,
-            vec!["count", "lower", "coalesce"]
+            vec!["count", "lower", "coalesce", "ifnull", "length"]
+        );
+    }
+
+    #[cfg(feature = "uuid-types")]
+    #[test]
+    fn infers_sqlite_uuid_extension_functions() {
+        let mut config = test_config(Vec::new());
+        config.type_mapping.uuid = UuidTypeMapping::Uuid;
+        let tables = parse_schema_catalog_with_config(
+            "CREATE TABLE users (id UUID PRIMARY KEY, parent_id UUID);",
+            &config.type_mapping,
+        )
+        .unwrap();
+        let catalog = SchemaCatalog {
+            tables,
+            fingerprint: Fingerprint::from_text("schema"),
+        };
+        let migration_fingerprint = Fingerprint::from_text("migrations");
+
+        let generated = shape_query(
+            &config,
+            &catalog,
+            &catalog.fingerprint,
+            &migration_fingerprint,
+            &Fingerprint::from_text("type-mapping"),
+            ParsedQuery {
+                name: "new_uuid".to_string(),
+                source_file: PathBuf::from("queries/uuid.sql"),
+                original_sql: "SELECT uuid4() AS generated_id".to_string(),
+                cardinality: Cardinality::One,
+            },
+        )
+        .unwrap();
+        assert_eq!(generated.columns[0].name, "generated_id");
+        assert_eq!(generated.columns[0].rust_type.0, "uuid::Uuid");
+        assert_eq!(generated.columns[0].db_type.as_deref(), Some("sqlite:UUID"));
+        assert_eq!(generated.columns[0].nullable, Nullability::NonNull);
+        assert_eq!(generated.dependencies.functions, vec!["uuid4"]);
+
+        let converted = shape_query(
+            &config,
+            &catalog,
+            &catalog.fingerprint,
+            &migration_fingerprint,
+            &Fingerprint::from_text("type-mapping"),
+            ParsedQuery {
+                name: "convert_uuid".to_string(),
+                source_file: PathBuf::from("queries/uuid.sql"),
+                original_sql: "SELECT gen_random_uuid() AS random_id, uuid7() AS ordered_id, uuid_str(id) AS id_text, uuid_blob(id) AS id_blob, uuid7_timestamp_ms(id) AS id_timestamp_ms FROM users".to_string(),
+                cardinality: Cardinality::Many,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(converted.columns[0].rust_type.0, "uuid::Uuid");
+        assert_eq!(converted.columns[1].rust_type.0, "uuid::Uuid");
+        assert_eq!(converted.columns[2].rust_type.0, "uuid::Uuid");
+        assert_eq!(converted.columns[3].rust_type.0, "uuid::Uuid");
+        assert_eq!(converted.columns[3].db_type.as_deref(), Some("sqlite:BLOB"));
+        assert_eq!(converted.columns[4].rust_type.0, "i64");
+        assert_eq!(converted.columns[4].nullable, Nullability::Nullable);
+        assert_eq!(
+            converted.dependencies.functions,
+            vec![
+                "gen_random_uuid",
+                "uuid7",
+                "uuid_str",
+                "uuid_blob",
+                "uuid7_timestamp_ms"
+            ]
         );
     }
 
@@ -1840,6 +2007,79 @@ mod tests {
         assert_eq!(shaped.params[1].name, "org_slug");
         assert_eq!(shaped.params[1].rust_type.0, "String");
         assert_eq!(shaped.params[1].db_type.as_deref(), Some("sqlite:TEXT"));
+    }
+
+    #[test]
+    fn infers_tuple_and_in_list_param_types_from_ast_pairs() {
+        let catalog = catalog();
+        let config = test_config(Vec::new());
+        let query = ParsedQuery {
+            name: "search_users".to_string(),
+            source_file: PathBuf::from("queries/users.sql"),
+            original_sql: "SELECT id FROM users u WHERE (u.id, u.org_id) = (:user_id, :organization_id) AND u.email IN (:primary_email, :secondary_email)".to_string(),
+            cardinality: Cardinality::Many,
+        };
+
+        let migration_fingerprint = Fingerprint::from_text("migrations");
+        let shaped = shape_query(
+            &config,
+            &catalog,
+            &catalog.fingerprint,
+            &migration_fingerprint,
+            &Fingerprint::from_text("type-mapping"),
+            query,
+        )
+        .unwrap();
+
+        assert_eq!(shaped.params.len(), 4);
+        assert_eq!(shaped.params[0].name, "user_id");
+        assert_eq!(shaped.params[0].rust_type.0, "i64");
+        assert_eq!(shaped.params[1].name, "organization_id");
+        assert_eq!(shaped.params[1].rust_type.0, "i64");
+        assert_eq!(shaped.params[2].name, "primary_email");
+        assert_eq!(shaped.params[2].rust_type.0, "String");
+        assert_eq!(shaped.params[3].name, "secondary_email");
+        assert_eq!(shaped.params[3].rust_type.0, "String");
+    }
+
+    #[test]
+    fn infers_range_pattern_and_distinct_param_types_from_ast_pairs() {
+        let catalog = catalog();
+        let config = test_config(Vec::new());
+        let query = ParsedQuery {
+            name: "search_emails".to_string(),
+            source_file: PathBuf::from("queries/emails.sql"),
+            original_sql: "SELECT e.id FROM emails e \
+                 WHERE e.created_at BETWEEN :start_at AND :end_at \
+                   AND e.email LIKE :email_pattern \
+                   AND e.kind IS NOT DISTINCT FROM :kind \
+                   AND :user_id IS DISTINCT FROM e.user_id"
+                .to_string(),
+            cardinality: Cardinality::Many,
+        };
+
+        let migration_fingerprint = Fingerprint::from_text("migrations");
+        let shaped = shape_query(
+            &config,
+            &catalog,
+            &catalog.fingerprint,
+            &migration_fingerprint,
+            &Fingerprint::from_text("type-mapping"),
+            query,
+        )
+        .unwrap();
+
+        assert_eq!(shaped.params.len(), 5);
+        assert_eq!(shaped.params[0].name, "start_at");
+        assert_eq!(shaped.params[0].rust_type.0, "String");
+        assert_eq!(shaped.params[1].name, "end_at");
+        assert_eq!(shaped.params[1].rust_type.0, "String");
+        assert_eq!(shaped.params[2].name, "email_pattern");
+        assert_eq!(shaped.params[2].rust_type.0, "String");
+        assert_eq!(shaped.params[3].name, "kind");
+        assert_eq!(shaped.params[3].rust_type.0, "String");
+        assert_eq!(shaped.params[4].name, "user_id");
+        assert_eq!(shaped.params[4].rust_type.0, "i64");
     }
 
     #[test]
@@ -2172,20 +2412,65 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
-    #[cfg(feature = "libsql-runtime")]
+    #[cfg(all(feature = "libsql-runtime", not(feature = "libsql-remote")))]
     #[test]
-    fn reports_remote_catalog_urls_without_schema_files() {
+    fn reports_remote_catalog_urls_need_remote_feature_without_schema_files() {
         let mut config = test_config(Vec::new());
         config.database.url = "libsql://example.turso.io".to_string();
 
         let err = inspect(&config, Vec::new()).unwrap_err();
 
         assert!(err.to_string().contains(
-            "live libSQL catalog introspection for remote URL `libsql://example.turso.io` is not supported yet"
+            "remote libSQL catalog introspection for `libsql://example.turso.io` requires enabling the QueryForge `libsql-remote` feature"
         ));
         assert!(err
             .to_string()
-            .contains("provide [schema].files for offline schema inference"));
+            .contains("provide [schema].files for offline inference"));
+    }
+
+    #[cfg(all(feature = "libsql-runtime", feature = "libsql-remote"))]
+    #[test]
+    fn reports_remote_catalog_urls_need_auth_without_schema_files() {
+        let mut config = test_config(Vec::new());
+        config.database.url = "libsql://example.turso.io".to_string();
+
+        let err = inspect(&config, Vec::new()).unwrap_err();
+
+        assert!(err.to_string().contains(
+            "remote libSQL catalog introspection for `libsql://example.turso.io` requires [database].auth_token or [database].auth_token_env"
+        ));
+        assert!(err
+            .to_string()
+            .contains("provide [schema].files for offline inference"));
+    }
+
+    #[cfg(all(feature = "libsql-runtime", feature = "uuid-types"))]
+    #[test]
+    fn remote_catalog_urls_with_schema_files_use_schema_fallback_without_auth() {
+        let dir = temp_dir("queryforge-libsql-remote-schema-fallback");
+        let schema = dir.join("schema.sql");
+        std::fs::write(
+            &schema,
+            "CREATE TABLE users (id UUID PRIMARY KEY, email TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        let mut config = test_config(vec![schema]);
+        config.database.url = "libsql://example.turso.io".to_string();
+        config.type_mapping.uuid = crate::config::UuidTypeMapping::Uuid;
+        let parsed = vec![ParsedQuery {
+            name: "get_user".to_string(),
+            source_file: PathBuf::from("queries/users.sql"),
+            original_sql: "SELECT id, email FROM users WHERE id = :id".to_string(),
+            cardinality: Cardinality::One,
+        }];
+
+        let project = inspect(&config, parsed).unwrap();
+
+        assert_eq!(project.queries[0].columns[0].rust_type.0, "uuid::Uuid");
+        assert_eq!(project.queries[0].params[0].rust_type.0, "uuid::Uuid");
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(feature = "libsql-runtime")]
@@ -2254,6 +2539,8 @@ mod tests {
             database: DatabaseConfig {
                 backend: DatabaseBackend::Libsql,
                 url: "file:test.db".to_string(),
+                auth_token: None,
+                auth_token_env: None,
             },
             codegen: CodegenConfig {
                 out_dir: PathBuf::from("generated"),

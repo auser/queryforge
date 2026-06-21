@@ -1,6 +1,8 @@
-# QueryForge starter
+# QueryForge
 
-A dependency-light starter for a Cornucopia-inspired Rust code generator that targets Postgres and libSQL.
+QueryForge is a SQL-first Rust code generator inspired by Cornucopia. It parses named SQL blocks, derives query parameter and row shapes from database metadata or catalog/schema inference, and generates typed async Rust functions for Postgres and libSQL/SQLite without turning SQL into an ORM.
+
+The project keeps the public API in the top-level `queryforge` crate. The CLI and `build.rs` helper crates are intentionally thin wrappers.
 
 ## Shape
 
@@ -11,7 +13,7 @@ queryforge/              # top-level public library crate
   crates/queryforge-build# thin build.rs wrapper
 ```
 
-The CLI and build helper both call the top-level `queryforge` API.
+Generated APIs are query-shaped. QueryForge emits functions and row DTOs for the SQL you write; application domain models stay in application code.
 
 ## Try it
 
@@ -200,6 +202,8 @@ queryforge = "0.1"
 
 QueryForge generates query-specific row DTOs from the columns returned by each SQL block. For example, a `--! get_user : one` query can generate a `GetUserRow` with fields that match the selected database columns. These generated rows are API boundary types, not ORM models: they do not own persistence behavior, relations, validation, or business methods.
 
+Query names drive generated API names: `--! get_user_with_org : one` generates a `get_user_with_org(...)` function and `GetUserWithOrgRow` row type in the module derived from the SQL file name. Join queries can select duplicate column names; QueryForge keeps generated Rust valid by suffixing duplicate field identifiers (`id`, `id_2`, etc.) and decoding rows by column position. Prefer explicit SQL aliases such as `u.id AS user_id` and `o.id AS org_id` when you want stable semantic field names.
+
 Keep domain models in application code and convert from generated rows:
 
 ```rust
@@ -253,6 +257,7 @@ The default `queryforge` crate stays dependency-light and does not compile datab
 - `postgres` enables live Postgres introspection through `tokio` and `tokio-postgres`.
 - `libsql` is reserved for the dependency-light libSQL/SQLite schema-driven generation path.
 - `libsql-runtime` enables adapters for upstream `libsql::Connection` and `libsql::Transaction`.
+- `libsql-remote` enables live remote libSQL catalog introspection in addition to `libsql-runtime`; remote databases also require `[database].auth_token` or `[database].auth_token_env`.
 - `queryforge-cli` and `queryforge-build` forward these features; enable `postgres` there only when a CLI/build script needs live Postgres introspection.
 - External generated type paths and native libSQL runtime adapters are feature-gated: `uuid-types`, `chrono-types`, `time-types`, `serde-json-types`, and `decimal-types`.
 
@@ -265,6 +270,10 @@ json = "serde-json"
 time = "chrono"
 decimal = "rust-decimal"
 ```
+
+`uuid = "uuid"` maps Postgres `uuid` metadata and SQLite/libSQL columns declared with `UUID` affinity to `uuid::Uuid`. QueryForge also recognizes common SQLite UUID extension functions such as `uuid4()`, `gen_random_uuid()`, `uuid7()`, `uuid_str(...)`, `uuid_blob(...)`, and `uuid7_timestamp_ms(...)` during libSQL inference. Without that setting, UUID values stay dependency-light as `String`.
+
+QueryForge does not load SQLite extensions for the application. If generated SQL calls SQLite UUID functions, the target libSQL/SQLite connection must have the UUID extension available at runtime.
 
 ```toml
 [build-dependencies]
@@ -281,11 +290,11 @@ rust_decimal = "1"
 
 QueryForge parses named SQL blocks, loads nested TOML config, normalizes named parameters, computes fingerprints, writes initial offline metadata with `queryforge prepare`, and generates Rust modules.
 
-The parser boundary is intentionally narrow: `nom` parses QueryForge block headers, while `sqlparser-rs` provides AST-backed lowering for supported PostgreSQL/SQLite `SELECT` shapes into the shared lightweight `sql_ir`, including structural extraction of named equality params. QueryForge keeps a compatibility fallback for SQL shapes not yet lowered from the AST, and it still relies on database metadata for final type inference rather than trying to become a full SQL engine.
+The parser boundary is intentional: `nom` parses QueryForge block headers, while `sqlparser-rs` provides AST-backed lowering for supported PostgreSQL/SQLite `CREATE TABLE`, `SELECT`, and mutation shapes into the shared lightweight `sql_ir`. QueryForge has an internal AST visitor over nested query, table, join, function, and expression paths so inference rules can inspect SQL structurally instead of reimplementing grammar. QueryForge keeps a compatibility fallback for SQL shapes not yet lowered from the AST, and it still relies on database metadata or conservative `Unknown` results rather than trying to become a full SQL engine.
 
 Postgres inspection uses `tokio-postgres` prepared statement metadata for parameter and column types. Direct table-column nullability is inferred from `pg_attribute`; conservative expression nullability handles direct columns, bind params, common expressions such as `CASE`, `nullif`, comparisons, arithmetic and boolean expressions, `BETWEEN`, `IN`/`NOT IN`, `LIKE`/`ILIKE`, outer joins, nullable parenthesized join groups, comma/CROSS-style table references, simple CTEs, declared recursive CTE result columns, recursive CTE branch nullability merging, derived-table subqueries, and lateral derived tables that depend on preceding outer relations, including lateral derived tables inside parenthesized join groups.
 
-libSQL inspection currently consumes `sql_ir` plus configured schema SQL files for dependency-free inference. With `libsql-runtime`, it can also inspect a local database catalog through `sqlite_schema`, `PRAGMA table_xinfo`, indexes, and foreign keys. It handles direct columns, joins, simple CTEs, declared CTE column lists, derived tables, lateral derived-table joins, compound select branch parameter types, `*`, simple equality parameter types, and basic expressions such as `count(*)`, `lower(...)`, `upper(...)`, `coalesce(...)`, and `||` string concatenation.
+libSQL inspection currently consumes `sql_ir` plus configured schema SQL files for dependency-free inference. With `libsql-runtime`, it can also inspect a local database catalog through `sqlite_schema`, `PRAGMA table_xinfo`, indexes, and foreign keys. With `libsql-remote`, the same catalog queries can run against a remote libSQL database when an auth token is configured. It handles direct columns, joins, simple CTEs, declared CTE column lists, derived tables, lateral derived-table joins, compound select branch parameter types, `*`, simple equality parameter types, and basic expressions such as `count(*)`, `lower(...)`, `upper(...)`, `coalesce(...)`, `ifnull(...)`, `length(...)`, and `||` string concatenation.
 
 SQLx Postgres and SQLx SQLite renderers emit executor-style async functions that can be called with pools, connections, or transactions. The tokio-postgres renderer emits `GenericClient`-based async functions for clients and transactions. Native libSQL rendering calls the QueryForge runtime executor trait and has concrete adapters for the upstream `libsql` crate.
 
@@ -299,8 +308,40 @@ cargo check --workspace --all-features
 cargo test --workspace --all-features
 ```
 
+CI runs the same all-feature formatting/check/test path, plus opt-in e2e jobs.
+
 The Docker-backed Postgres e2e is opt-in:
 
 ```bash
 QUERYFORGE_E2E_POSTGRES=1 cargo test -p queryforge --features postgres --test postgres_e2e -- --nocapture
+```
+
+The credentialed remote libSQL e2e is also opt-in:
+
+```bash
+QUERYFORGE_E2E_LIBSQL_REMOTE=1 \
+QUERYFORGE_LIBSQL_REMOTE_URL="libsql://..." \
+QUERYFORGE_LIBSQL_AUTH_TOKEN="..." \
+cargo test -p queryforge --features libsql-remote --test libsql_remote_e2e -- --nocapture
+```
+
+The GitHub Actions workflow runs the remote libSQL e2e automatically when repository secrets named `LIBSQL_REMOTE_URL` and `LIBSQL_AUTH_TOKEN` are configured; otherwise that job records an explicit skip.
+
+Runnable generated-code e2e examples are also available:
+
+```bash
+cargo run -p queryforge-sqlite-e2e-example
+cargo test -p queryforge-sqlite-e2e-example
+```
+
+```bash
+docker run --rm --name queryforge-postgres-e2e-example \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=queryforge \
+  -p 127.0.0.1:55432:5432 \
+  postgres:16-alpine
+```
+
+```bash
+cargo run --manifest-path examples/postgres-e2e/Cargo.toml
 ```

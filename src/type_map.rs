@@ -69,6 +69,8 @@ pub fn sqlite_declared_type_to_rust_with_config(
         RustType("Vec<u8>".to_string())
     } else if upper.contains("BOOL") {
         RustType("bool".to_string())
+    } else if upper.contains("UUID") && mapping.uuid == UuidTypeMapping::Uuid {
+        RustType("uuid::Uuid".to_string())
     } else if upper.contains("JSON") && mapping.json == JsonTypeMapping::SerdeJson {
         RustType("serde_json::Value".to_string())
     } else if (upper.contains("DECIMAL") || upper.contains("NUMERIC"))
@@ -158,6 +160,10 @@ mod tests {
             "uuid::Uuid"
         );
         assert_eq!(
+            sqlite_declared_type_to_rust_with_config("UUID", &mapping).0,
+            "uuid::Uuid"
+        );
+        assert_eq!(
             postgres_type_to_rust_with_config("jsonb", &mapping).0,
             "serde_json::Value"
         );
@@ -210,6 +216,8 @@ mod tests {
             database: DatabaseConfig {
                 backend: DatabaseBackend::Postgres,
                 url: "postgres://localhost/queryforge".to_string(),
+                auth_token: None,
+                auth_token_env: None,
             },
             codegen: CodegenConfig {
                 out_dir: PathBuf::from("generated"),
@@ -234,6 +242,8 @@ mod tests {
             database: DatabaseConfig {
                 backend: DatabaseBackend::Postgres,
                 url: "postgres://localhost/queryforge".to_string(),
+                auth_token: None,
+                auth_token_env: None,
             },
             codegen: CodegenConfig {
                 out_dir: PathBuf::from("generated"),

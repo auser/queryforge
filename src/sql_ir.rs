@@ -4,10 +4,13 @@ use nom::combinator::{map, opt, recognize};
 use nom::sequence::delimited;
 use nom::{IResult, Parser};
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, JoinConstraint,
-    JoinOperator, ObjectName, ObjectNamePart, Query, Select, SelectItem,
+    AssignmentTarget, BinaryOperator, ColumnDef as AstColumnDef, ColumnOption, ConnectByKind,
+    CreateTable, Delete, Expr, FromTable, FunctionArg, FunctionArgExpr, FunctionArgumentClause,
+    FunctionArguments, GroupByExpr, Insert, JoinConstraint, JoinOperator, LimitClause, ObjectName,
+    ObjectNamePart, OrderBy, OrderByKind, Query, Select, SelectItem,
     SelectItemQualifiedWildcardKind, SetExpr, SetOperator, SetQuantifier,
-    Statement as AstStatement, TableAlias, TableFactor, TableWithJoins, Value,
+    Statement as AstStatement, TableAlias, TableConstraint, TableFactor, TableObject,
+    TableWithJoins, TopQuantity, Update, Value,
 };
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser as SqlParser;
@@ -94,6 +97,19 @@ pub struct EqualityParam {
     pub param: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationStatement {
+    pub table: String,
+    pub column_params: Vec<MutationColumnParam>,
+    pub equality_params: Vec<EqualityParam>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MutationColumnParam {
+    pub column: String,
+    pub param: String,
+}
+
 pub fn parse_statements(sql: &str) -> Result<Vec<SqlStatement>> {
     split_sql_statements(sql)
         .into_iter()
@@ -114,6 +130,78 @@ pub fn parse_statement(sql: &str) -> Result<SqlStatement> {
 }
 
 pub fn parse_create_table(sql: &str) -> Result<Option<CreateTableStatement>> {
+    if let Some(statement) = parse_create_table_with_sqlparser(sql) {
+        return Ok(Some(statement));
+    }
+
+    parse_create_table_heuristic(sql)
+}
+
+fn parse_create_table_with_sqlparser(sql: &str) -> Option<CreateTableStatement> {
+    let cleaned = trim_trailing_semicolon(sql.trim());
+    let statement = parse_sqlparser_statement(cleaned)?;
+    let AstStatement::CreateTable(create_table) = statement else {
+        return None;
+    };
+    Some(lower_create_table(&create_table))
+}
+
+fn lower_create_table(create_table: &CreateTable) -> CreateTableStatement {
+    let primary_key_columns = create_table
+        .constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            TableConstraint::PrimaryKey(primary_key) => Some(primary_key),
+            _ => None,
+        })
+        .flat_map(|primary_key| primary_key.columns.iter())
+        .filter_map(|column| column_name_from_expr(&column.column.expr))
+        .map(|(_, column)| normalize_sqlparser_ident(&column))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let columns = create_table
+        .columns
+        .iter()
+        .map(|column| lower_column_definition(column, &primary_key_columns))
+        .collect();
+
+    CreateTableStatement {
+        table: object_name_to_string(&create_table.name),
+        columns,
+    }
+}
+
+fn lower_column_definition(
+    column: &AstColumnDef,
+    primary_key_columns: &std::collections::BTreeSet<String>,
+) -> ColumnDefinition {
+    let is_primary_key = primary_key_columns
+        .contains(&normalize_sqlparser_ident(&column.name.value))
+        || column
+            .options
+            .iter()
+            .any(|option| matches!(option.option, ColumnOption::PrimaryKey(_)));
+    let is_not_null = column
+        .options
+        .iter()
+        .any(|option| matches!(option.option, ColumnOption::NotNull));
+
+    ColumnDefinition {
+        name: column.name.value.clone(),
+        declared_type: column.data_type.to_string(),
+        nullable: if is_primary_key || is_not_null {
+            ColumnNullability::NonNull
+        } else {
+            ColumnNullability::Nullable
+        },
+    }
+}
+
+fn normalize_sqlparser_ident(value: &str) -> String {
+    value.to_ascii_lowercase()
+}
+
+fn parse_create_table_heuristic(sql: &str) -> Result<Option<CreateTableStatement>> {
     let trimmed = sql.trim();
     let Ok((rest, table)) = create_table_prefix(trimmed) else {
         return Ok(None);
@@ -142,6 +230,133 @@ pub fn parse_create_table(sql: &str) -> Result<Option<CreateTableStatement>> {
 
 pub fn parse_select(sql: &str) -> Option<SelectStatement> {
     parse_select_with_sqlparser(sql).or_else(|| parse_select_heuristic(sql))
+}
+
+pub fn parse_mutation(sql: &str) -> Option<MutationStatement> {
+    let cleaned = trim_trailing_semicolon(sql.trim());
+    match parse_sqlparser_statement(cleaned)? {
+        AstStatement::Insert(insert) => lower_insert_mutation(&insert),
+        AstStatement::Update(update) => lower_update_mutation(&update),
+        AstStatement::Delete(delete) => lower_delete_mutation(&delete),
+        _ => None,
+    }
+}
+
+fn lower_insert_mutation(insert: &Insert) -> Option<MutationStatement> {
+    let table = match &insert.table {
+        TableObject::TableName(name) => object_name_to_string(name),
+        TableObject::TableFunction(_) | TableObject::TableQuery(_) => return None,
+    };
+    let mut column_params = Vec::new();
+
+    for assignment in &insert.assignments {
+        let AssignmentTarget::ColumnName(column) = &assignment.target else {
+            continue;
+        };
+        if let Some(param) = named_param_from_expr(&assignment.value) {
+            column_params.push(MutationColumnParam {
+                column: last_object_name_part(column)?,
+                param,
+            });
+        }
+    }
+
+    if let Some(source) = &insert.source {
+        if let SetExpr::Values(values) = &*source.body {
+            if let Some(row) = values.rows.first() {
+                for (column, value) in insert.columns.iter().zip(row.iter()) {
+                    if let Some(param) = named_param_from_expr(value) {
+                        column_params.push(MutationColumnParam {
+                            column: last_object_name_part(column)?,
+                            param,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Some(MutationStatement {
+        table,
+        column_params,
+        equality_params: Vec::new(),
+    })
+}
+
+fn lower_update_mutation(update: &Update) -> Option<MutationStatement> {
+    let table = mutation_table_from_table_factor(&update.table.relation)?;
+    let mut column_params = Vec::new();
+
+    for assignment in &update.assignments {
+        match &assignment.target {
+            AssignmentTarget::ColumnName(column) => {
+                if let Some(param) = named_param_from_expr(&assignment.value) {
+                    column_params.push(MutationColumnParam {
+                        column: last_object_name_part(column)?,
+                        param,
+                    });
+                }
+            }
+            AssignmentTarget::Tuple(columns) => {
+                let Expr::Tuple(values) = &assignment.value else {
+                    continue;
+                };
+                for (column, value) in columns.iter().zip(values.iter()) {
+                    if let Some(param) = named_param_from_expr(value) {
+                        column_params.push(MutationColumnParam {
+                            column: last_object_name_part(column)?,
+                            param,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let mut equality_params = Vec::new();
+    if let Some(selection) = &update.selection {
+        equality_params = infer_equality_param_pairs_from_expr(selection);
+    }
+
+    Some(MutationStatement {
+        table,
+        column_params,
+        equality_params,
+    })
+}
+
+fn lower_delete_mutation(delete: &Delete) -> Option<MutationStatement> {
+    let table = match &delete.from {
+        FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => {
+            let first = tables.first()?;
+            mutation_table_from_table_factor(&first.relation)?
+        }
+    };
+
+    let mut equality_params = Vec::new();
+    if let Some(selection) = &delete.selection {
+        equality_params = infer_equality_param_pairs_from_expr(selection);
+    }
+
+    Some(MutationStatement {
+        table,
+        column_params: Vec::new(),
+        equality_params,
+    })
+}
+
+fn mutation_table_from_table_factor(table_factor: &TableFactor) -> Option<String> {
+    match table_factor {
+        TableFactor::Table { name, .. } => Some(object_name_to_string(name)),
+        _ => None,
+    }
+}
+
+fn last_object_name_part(name: &ObjectName) -> Option<String> {
+    name.0.last().map(|part| match part {
+        ObjectNamePart::Identifier(ident) => ident.value.clone(),
+        ObjectNamePart::Function(function) => function.to_string(),
+    })
 }
 
 fn parse_select_with_sqlparser(sql: &str) -> Option<SelectStatement> {
@@ -221,108 +436,277 @@ fn infer_equality_param_pairs_from_query(
     query: &Query,
     include_compound_branches: bool,
 ) -> Vec<EqualityParam> {
-    let mut pairs = Vec::new();
-    collect_query_equality_params(query, include_compound_branches, &mut pairs);
-    pairs
+    if !include_compound_branches {
+        return lower_set_expr(&query.body)
+            .map(|(select, _)| infer_equality_param_pairs_from_select(select))
+            .unwrap_or_default();
+    }
+
+    let mut visitor = EqualityParamVisitor::default();
+    walk_query(query, include_compound_branches, &mut visitor);
+    visitor.pairs
 }
 
 fn infer_equality_param_pairs_from_select(select: &Select) -> Vec<EqualityParam> {
-    let mut pairs = Vec::new();
-    collect_select_equality_params(select, &mut pairs);
-    pairs
+    let mut visitor = EqualityParamVisitor::default();
+    walk_select(select, &mut visitor);
+    visitor.pairs
 }
 
-fn collect_query_equality_params(
+fn infer_equality_param_pairs_from_expr(expr: &Expr) -> Vec<EqualityParam> {
+    let mut visitor = EqualityParamVisitor::default();
+    walk_expr(expr, &mut visitor);
+    visitor.pairs
+}
+
+#[derive(Default)]
+struct EqualityParamVisitor {
+    pairs: Vec<EqualityParam>,
+}
+
+impl AstVisitor for EqualityParamVisitor {
+    fn enter_expr(&mut self, expr: &Expr) {
+        collect_equality_param_pairs_from_expr(expr, &mut self.pairs);
+    }
+}
+
+trait AstVisitor {
+    fn enter_query(&mut self, _query: &Query) {}
+    fn enter_select(&mut self, _select: &Select) {}
+    fn enter_table_factor(&mut self, _table_factor: &TableFactor) {}
+    fn enter_expr(&mut self, _expr: &Expr) {}
+}
+
+fn walk_query<V: AstVisitor + ?Sized>(
     query: &Query,
     include_compound_branches: bool,
-    pairs: &mut Vec<EqualityParam>,
+    visitor: &mut V,
 ) {
+    visitor.enter_query(query);
+
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            collect_query_equality_params(&cte.query, true, pairs);
+            walk_query(&cte.query, true, visitor);
         }
     }
-    collect_set_expr_equality_params(&query.body, include_compound_branches, pairs);
+
+    walk_set_expr(&query.body, include_compound_branches, visitor);
+
+    if let Some(order_by) = &query.order_by {
+        walk_order_by(order_by, visitor);
+    }
+    if let Some(limit_clause) = &query.limit_clause {
+        walk_limit_clause(limit_clause, visitor);
+    }
+    if let Some(fetch) = &query.fetch {
+        if let Some(quantity) = &fetch.quantity {
+            walk_expr(quantity, visitor);
+        }
+    }
 }
 
-fn collect_set_expr_equality_params(
+fn walk_set_expr<V: AstVisitor + ?Sized>(
     set_expr: &SetExpr,
     include_compound_branches: bool,
-    pairs: &mut Vec<EqualityParam>,
+    visitor: &mut V,
 ) {
     match set_expr {
-        SetExpr::Select(select) => collect_select_equality_params(select, pairs),
-        SetExpr::Query(query) => {
-            collect_query_equality_params(query, include_compound_branches, pairs);
-        }
+        SetExpr::Select(select) => walk_select(select, visitor),
+        SetExpr::Query(query) => walk_query(query, include_compound_branches, visitor),
         SetExpr::SetOperation { left, right, .. } => {
-            collect_set_expr_equality_params(left, include_compound_branches, pairs);
+            walk_set_expr(left, include_compound_branches, visitor);
             if include_compound_branches {
-                collect_set_expr_equality_params(right, include_compound_branches, pairs);
+                walk_set_expr(right, include_compound_branches, visitor);
             }
         }
-        _ => {}
+        SetExpr::Values(values) => {
+            for row in &values.rows {
+                for expr in row.iter() {
+                    walk_expr(expr, visitor);
+                }
+            }
+        }
+        SetExpr::Insert(_)
+        | SetExpr::Update(_)
+        | SetExpr::Delete(_)
+        | SetExpr::Merge(_)
+        | SetExpr::Table(_) => {}
     }
 }
 
-fn collect_select_equality_params(select: &Select, pairs: &mut Vec<EqualityParam>) {
+fn walk_select<V: AstVisitor + ?Sized>(select: &Select, visitor: &mut V) {
+    visitor.enter_select(select);
+
+    if let Some(top) = &select.top {
+        if let Some(TopQuantity::Expr(quantity)) = &top.quantity {
+            walk_expr(quantity, visitor);
+        }
+    }
+
     for projection in &select.projection {
         match projection {
             SelectItem::UnnamedExpr(expr)
             | SelectItem::ExprWithAlias { expr, .. }
-            | SelectItem::ExprWithAliases { expr, .. } => collect_expr_equality_params(expr, pairs),
+            | SelectItem::ExprWithAliases { expr, .. } => walk_expr(expr, visitor),
             SelectItem::QualifiedWildcard(_, _) | SelectItem::Wildcard(_) => {}
         }
     }
 
-    collect_table_sources_equality_params(&select.from, pairs);
-
+    for table_with_joins in &select.from {
+        walk_table_with_joins(table_with_joins, visitor);
+    }
+    for lateral_view in &select.lateral_views {
+        walk_expr(&lateral_view.lateral_view, visitor);
+    }
+    if let Some(prewhere) = &select.prewhere {
+        walk_expr(prewhere, visitor);
+    }
     if let Some(selection) = &select.selection {
-        collect_expr_equality_params(selection, pairs);
+        walk_expr(selection, visitor);
     }
-    if let Some(having) = &select.having {
-        collect_expr_equality_params(having, pairs);
-    }
-}
-
-fn collect_table_sources_equality_params(
-    table_with_joins: &[TableWithJoins],
-    pairs: &mut Vec<EqualityParam>,
-) {
-    for table_with_join in table_with_joins {
-        collect_table_factor_equality_params(&table_with_join.relation, pairs);
-        for join in &table_with_join.joins {
-            collect_table_factor_equality_params(&join.relation, pairs);
-            collect_join_constraint_equality_params(&join.join_operator, pairs);
+    for connect_by in &select.connect_by {
+        match connect_by {
+            ConnectByKind::ConnectBy { relationships, .. } => {
+                for relationship in relationships {
+                    walk_expr(relationship, visitor);
+                }
+            }
+            ConnectByKind::StartWith { condition, .. } => walk_expr(condition, visitor),
         }
     }
+    walk_group_by(&select.group_by, visitor);
+    for expr in &select.cluster_by {
+        walk_expr(expr, visitor);
+    }
+    for expr in &select.distribute_by {
+        walk_expr(expr, visitor);
+    }
+    for order_by in &select.sort_by {
+        walk_order_by_expr(order_by, visitor);
+    }
+    if let Some(having) = &select.having {
+        walk_expr(having, visitor);
+    }
+    if let Some(qualify) = &select.qualify {
+        walk_expr(qualify, visitor);
+    }
 }
 
-fn collect_table_factor_equality_params(
-    table_factor: &TableFactor,
-    pairs: &mut Vec<EqualityParam>,
+fn walk_table_with_joins<V: AstVisitor + ?Sized>(
+    table_with_joins: &TableWithJoins,
+    visitor: &mut V,
 ) {
+    walk_table_factor(&table_with_joins.relation, visitor);
+    for join in &table_with_joins.joins {
+        walk_table_factor(&join.relation, visitor);
+        walk_join_constraint(&join.join_operator, visitor);
+    }
+}
+
+fn walk_table_factor<V: AstVisitor + ?Sized>(table_factor: &TableFactor, visitor: &mut V) {
+    visitor.enter_table_factor(table_factor);
+
     match table_factor {
-        TableFactor::Derived { subquery, .. } => {
-            collect_query_equality_params(subquery, true, pairs)
+        TableFactor::Table { with_hints, .. } => {
+            for hint in with_hints {
+                walk_expr(hint, visitor);
+            }
+        }
+        TableFactor::Derived { subquery, .. } => walk_query(subquery, true, visitor),
+        TableFactor::TableFunction { expr, .. } => walk_expr(expr, visitor),
+        TableFactor::Function { args, .. } => {
+            for arg in args {
+                walk_function_arg(arg, visitor);
+            }
+        }
+        TableFactor::UNNEST { array_exprs, .. } => {
+            for expr in array_exprs {
+                walk_expr(expr, visitor);
+            }
+        }
+        TableFactor::JsonTable { json_expr, .. } | TableFactor::OpenJsonTable { json_expr, .. } => {
+            walk_expr(json_expr, visitor)
         }
         TableFactor::NestedJoin {
             table_with_joins, ..
-        } => collect_table_sources_equality_params(std::slice::from_ref(table_with_joins), pairs),
-        TableFactor::TableFunction { expr, .. } => collect_expr_equality_params(expr, pairs),
-        TableFactor::Function { args, .. } => {
-            for arg in args {
-                collect_function_arg_equality_params(arg, pairs);
+        } => walk_table_with_joins(table_with_joins, visitor),
+        TableFactor::Pivot {
+            table,
+            aggregate_functions,
+            value_column,
+            default_on_null,
+            ..
+        } => {
+            walk_table_factor(table, visitor);
+            for expr_with_alias in aggregate_functions {
+                walk_expr(&expr_with_alias.expr, visitor);
+            }
+            for expr in value_column {
+                walk_expr(expr, visitor);
+            }
+            if let Some(default_on_null) = default_on_null {
+                walk_expr(default_on_null, visitor);
             }
         }
-        _ => {}
+        TableFactor::Unpivot {
+            table,
+            value,
+            columns,
+            ..
+        } => {
+            walk_table_factor(table, visitor);
+            walk_expr(value, visitor);
+            for expr_with_alias in columns {
+                walk_expr(&expr_with_alias.expr, visitor);
+            }
+        }
+        TableFactor::MatchRecognize {
+            table,
+            partition_by,
+            order_by,
+            measures,
+            symbols,
+            ..
+        } => {
+            walk_table_factor(table, visitor);
+            for expr in partition_by {
+                walk_expr(expr, visitor);
+            }
+            for order_by in order_by {
+                walk_order_by_expr(order_by, visitor);
+            }
+            for measure in measures {
+                walk_expr(&measure.expr, visitor);
+            }
+            for symbol in symbols {
+                walk_expr(&symbol.definition, visitor);
+            }
+        }
+        TableFactor::XmlTable { row_expression, .. } => walk_expr(row_expression, visitor),
+        TableFactor::SemanticView {
+            dimensions,
+            metrics,
+            facts,
+            where_clause,
+            ..
+        } => {
+            for expr in dimensions {
+                walk_expr(expr, visitor);
+            }
+            for expr in metrics {
+                walk_expr(expr, visitor);
+            }
+            for expr in facts {
+                walk_expr(expr, visitor);
+            }
+            if let Some(where_clause) = where_clause {
+                walk_expr(where_clause, visitor);
+            }
+        }
     }
 }
 
-fn collect_join_constraint_equality_params(
-    operator: &JoinOperator,
-    pairs: &mut Vec<EqualityParam>,
-) {
+fn walk_join_constraint<V: AstVisitor + ?Sized>(operator: &JoinOperator, visitor: &mut V) {
     let constraint = match operator {
         JoinOperator::Join(constraint)
         | JoinOperator::Inner(constraint)
@@ -348,41 +732,196 @@ fn collect_join_constraint_equality_params(
     };
 
     if let JoinConstraint::On(expr) = constraint {
-        collect_expr_equality_params(expr, pairs);
+        walk_expr(expr, visitor);
     }
 }
 
-fn collect_expr_equality_params(expr: &Expr, pairs: &mut Vec<EqualityParam>) {
-    match expr {
-        Expr::BinaryOp { left, op, right } => {
-            if *op == BinaryOperator::Eq {
-                if let Some(pair) = equality_param_from_exprs(left, right) {
-                    pairs.push(pair);
+fn walk_group_by<V: AstVisitor + ?Sized>(group_by: &GroupByExpr, visitor: &mut V) {
+    match group_by {
+        GroupByExpr::All(_) => {}
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            for expr in exprs {
+                walk_expr(expr, visitor);
+            }
+            for modifier in modifiers {
+                if let sqlparser::ast::GroupByWithModifier::GroupingSets(expr) = modifier {
+                    walk_expr(expr, visitor);
                 }
             }
-            collect_expr_equality_params(left, pairs);
-            collect_expr_equality_params(right, pairs);
         }
-        Expr::Nested(expr)
+    }
+}
+
+fn walk_order_by<V: AstVisitor + ?Sized>(order_by: &OrderBy, visitor: &mut V) {
+    if let OrderByKind::Expressions(exprs) = &order_by.kind {
+        for expr in exprs {
+            walk_order_by_expr(expr, visitor);
+        }
+    }
+}
+
+fn walk_order_by_expr<V: AstVisitor + ?Sized>(
+    order_by: &sqlparser::ast::OrderByExpr,
+    visitor: &mut V,
+) {
+    walk_expr(&order_by.expr, visitor);
+}
+
+fn walk_limit_clause<V: AstVisitor + ?Sized>(limit_clause: &LimitClause, visitor: &mut V) {
+    match limit_clause {
+        LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        } => {
+            if let Some(limit) = limit {
+                walk_expr(limit, visitor);
+            }
+            if let Some(offset) = offset {
+                walk_expr(&offset.value, visitor);
+            }
+            for expr in limit_by {
+                walk_expr(expr, visitor);
+            }
+        }
+        LimitClause::OffsetCommaLimit { offset, limit } => {
+            walk_expr(offset, visitor);
+            walk_expr(limit, visitor);
+        }
+    }
+}
+
+fn walk_function_arguments<V: AstVisitor + ?Sized>(arguments: &FunctionArguments, visitor: &mut V) {
+    match arguments {
+        FunctionArguments::None => {}
+        FunctionArguments::Subquery(query) => walk_query(query, true, visitor),
+        FunctionArguments::List(arguments) => {
+            for arg in &arguments.args {
+                walk_function_arg(arg, visitor);
+            }
+            for clause in &arguments.clauses {
+                match clause {
+                    FunctionArgumentClause::OrderBy(order_by) => {
+                        for order_by in order_by {
+                            walk_order_by_expr(order_by, visitor);
+                        }
+                    }
+                    FunctionArgumentClause::Limit(limit) => walk_expr(limit, visitor),
+                    FunctionArgumentClause::Having(bound) => walk_expr(&bound.1, visitor),
+                    FunctionArgumentClause::IgnoreOrRespectNulls(_)
+                    | FunctionArgumentClause::OnOverflow(_)
+                    | FunctionArgumentClause::Separator(_)
+                    | FunctionArgumentClause::JsonNullClause(_)
+                    | FunctionArgumentClause::JsonReturningClause(_) => {}
+                }
+            }
+        }
+    }
+}
+
+fn walk_function_arg<V: AstVisitor + ?Sized>(arg: &FunctionArg, visitor: &mut V) {
+    match arg {
+        FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => {
+            walk_function_arg_expr(arg, visitor);
+        }
+        FunctionArg::ExprNamed { name, arg, .. } => {
+            walk_expr(name, visitor);
+            walk_function_arg_expr(arg, visitor);
+        }
+    }
+}
+
+fn walk_function_arg_expr<V: AstVisitor + ?Sized>(arg: &FunctionArgExpr, visitor: &mut V) {
+    if let FunctionArgExpr::Expr(expr) = arg {
+        walk_expr(expr, visitor);
+    }
+}
+
+fn walk_expr<V: AstVisitor + ?Sized>(expr: &Expr, visitor: &mut V) {
+    visitor.enter_expr(expr);
+
+    match expr {
+        Expr::CompoundFieldAccess { root, access_chain } => {
+            walk_expr(root, visitor);
+            for access in access_chain {
+                match access {
+                    sqlparser::ast::AccessExpr::Dot(expr) => walk_expr(expr, visitor),
+                    sqlparser::ast::AccessExpr::Subscript(subscript) => {
+                        walk_subscript(subscript, visitor);
+                    }
+                }
+            }
+        }
+        Expr::JsonAccess { value, .. } => walk_expr(value, visitor),
+        Expr::IsFalse(expr)
+        | Expr::IsNotFalse(expr)
+        | Expr::IsTrue(expr)
+        | Expr::IsNotTrue(expr)
+        | Expr::IsNull(expr)
+        | Expr::IsNotNull(expr)
+        | Expr::IsUnknown(expr)
+        | Expr::IsNotUnknown(expr)
+        | Expr::IsNormalized { expr, .. }
+        | Expr::Nested(expr)
         | Expr::UnaryOp { expr, .. }
-        | Expr::Cast { expr, .. }
         | Expr::Convert { expr, .. }
+        | Expr::Cast { expr, .. }
         | Expr::Extract { expr, .. }
         | Expr::Ceil { expr, .. }
         | Expr::Floor { expr, .. }
         | Expr::Collate { expr, .. }
         | Expr::Prefixed { value: expr, .. }
-        | Expr::Named { expr, .. } => collect_expr_equality_params(expr, pairs),
+        | Expr::Named { expr, .. }
+        | Expr::OuterJoin(expr)
+        | Expr::Prior(expr) => walk_expr(expr, visitor),
+        Expr::IsDistinctFrom(left, right)
+        | Expr::IsNotDistinctFrom(left, right)
+        | Expr::BinaryOp { left, right, .. }
+        | Expr::AnyOp { left, right, .. }
+        | Expr::AllOp { left, right, .. } => {
+            walk_expr(left, visitor);
+            walk_expr(right, visitor);
+        }
+        Expr::InList { expr, list, .. } => {
+            walk_expr(expr, visitor);
+            for item in list {
+                walk_expr(item, visitor);
+            }
+        }
+        Expr::InSubquery { expr, subquery, .. } => {
+            walk_expr(expr, visitor);
+            walk_query(subquery, true, visitor);
+        }
+        Expr::InUnnest {
+            expr, array_expr, ..
+        } => {
+            walk_expr(expr, visitor);
+            walk_expr(array_expr, visitor);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            walk_expr(expr, visitor);
+            walk_expr(low, visitor);
+            walk_expr(high, visitor);
+        }
+        Expr::Like { expr, pattern, .. }
+        | Expr::ILike { expr, pattern, .. }
+        | Expr::SimilarTo { expr, pattern, .. }
+        | Expr::RLike { expr, pattern, .. } => {
+            walk_expr(expr, visitor);
+            walk_expr(pattern, visitor);
+        }
         Expr::AtTimeZone {
             timestamp,
             time_zone,
         } => {
-            collect_expr_equality_params(timestamp, pairs);
-            collect_expr_equality_params(time_zone, pairs);
+            walk_expr(timestamp, visitor);
+            walk_expr(time_zone, visitor);
         }
         Expr::Position { expr, r#in } => {
-            collect_expr_equality_params(expr, pairs);
-            collect_expr_equality_params(r#in, pairs);
+            walk_expr(expr, visitor);
+            walk_expr(r#in, visitor);
         }
         Expr::Substring {
             expr,
@@ -390,12 +929,12 @@ fn collect_expr_equality_params(expr: &Expr, pairs: &mut Vec<EqualityParam>) {
             substring_for,
             ..
         } => {
-            collect_expr_equality_params(expr, pairs);
+            walk_expr(expr, visitor);
             if let Some(substring_from) = substring_from {
-                collect_expr_equality_params(substring_from, pairs);
+                walk_expr(substring_from, visitor);
             }
             if let Some(substring_for) = substring_for {
-                collect_expr_equality_params(substring_for, pairs);
+                walk_expr(substring_for, visitor);
             }
         }
         Expr::Trim {
@@ -405,12 +944,12 @@ fn collect_expr_equality_params(expr: &Expr, pairs: &mut Vec<EqualityParam>) {
             ..
         } => {
             if let Some(trim_what) = trim_what {
-                collect_expr_equality_params(trim_what, pairs);
+                walk_expr(trim_what, visitor);
             }
-            collect_expr_equality_params(expr, pairs);
+            walk_expr(expr, visitor);
             if let Some(trim_characters) = trim_characters {
                 for trim_character in trim_characters {
-                    collect_expr_equality_params(trim_character, pairs);
+                    walk_expr(trim_character, visitor);
                 }
             }
         }
@@ -420,11 +959,21 @@ fn collect_expr_equality_params(expr: &Expr, pairs: &mut Vec<EqualityParam>) {
             overlay_from,
             overlay_for,
         } => {
-            collect_expr_equality_params(expr, pairs);
-            collect_expr_equality_params(overlay_what, pairs);
-            collect_expr_equality_params(overlay_from, pairs);
+            walk_expr(expr, visitor);
+            walk_expr(overlay_what, visitor);
+            walk_expr(overlay_from, visitor);
             if let Some(overlay_for) = overlay_for {
-                collect_expr_equality_params(overlay_for, pairs);
+                walk_expr(overlay_for, visitor);
+            }
+        }
+        Expr::Function(function) => {
+            walk_function_arguments(&function.parameters, visitor);
+            walk_function_arguments(&function.args, visitor);
+            if let Some(filter) = &function.filter {
+                walk_expr(filter, visitor);
+            }
+            for order_by in &function.within_group {
+                walk_order_by_expr(order_by, visitor);
             }
         }
         Expr::Case {
@@ -434,121 +983,214 @@ fn collect_expr_equality_params(expr: &Expr, pairs: &mut Vec<EqualityParam>) {
             ..
         } => {
             if let Some(operand) = operand {
-                collect_expr_equality_params(operand, pairs);
+                walk_expr(operand, visitor);
             }
             for condition in conditions {
-                collect_expr_equality_params(&condition.condition, pairs);
-                collect_expr_equality_params(&condition.result, pairs);
+                walk_expr(&condition.condition, visitor);
+                walk_expr(&condition.result, visitor);
             }
             if let Some(else_result) = else_result {
-                collect_expr_equality_params(else_result, pairs);
+                walk_expr(else_result, visitor);
             }
         }
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery) => {
-            collect_query_equality_params(subquery, true, pairs);
+            walk_query(subquery, true, visitor);
         }
-        Expr::InSubquery { expr, subquery, .. } => {
-            collect_expr_equality_params(expr, pairs);
-            collect_query_equality_params(subquery, true, pairs);
+        Expr::GroupingSets(groups) | Expr::Cube(groups) | Expr::Rollup(groups) => {
+            for group in groups {
+                for item in group {
+                    walk_expr(item, visitor);
+                }
+            }
+        }
+        Expr::Tuple(items) => {
+            for item in items {
+                walk_expr(item, visitor);
+            }
+        }
+        Expr::Struct { values, .. } => {
+            for value in values {
+                walk_expr(value, visitor);
+            }
+        }
+        Expr::Dictionary(fields) => {
+            for field in fields {
+                walk_expr(&field.value, visitor);
+            }
+        }
+        Expr::Map(map) => {
+            for entry in &map.entries {
+                walk_expr(&entry.key, visitor);
+                walk_expr(&entry.value, visitor);
+            }
+        }
+        Expr::Array(array) => {
+            for elem in &array.elem {
+                walk_expr(elem, visitor);
+            }
+        }
+        Expr::Interval(interval) => {
+            walk_expr(&interval.value, visitor);
+        }
+        Expr::Lambda(lambda) => walk_expr(&lambda.body, visitor),
+        Expr::MemberOf(member_of) => {
+            walk_expr(&member_of.value, visitor);
+            walk_expr(&member_of.array, visitor);
+        }
+        Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Value(_)
+        | Expr::TypedString(_)
+        | Expr::MatchAgainst { .. }
+        | Expr::Wildcard(_)
+        | Expr::QualifiedWildcard(_, _) => {}
+    }
+}
+
+fn walk_subscript<V: AstVisitor + ?Sized>(subscript: &sqlparser::ast::Subscript, visitor: &mut V) {
+    match subscript {
+        sqlparser::ast::Subscript::Index { index } => walk_expr(index, visitor),
+        sqlparser::ast::Subscript::Slice {
+            lower_bound,
+            upper_bound,
+            stride,
+        } => {
+            if let Some(lower_bound) = lower_bound {
+                walk_expr(lower_bound, visitor);
+            }
+            if let Some(upper_bound) = upper_bound {
+                walk_expr(upper_bound, visitor);
+            }
+            if let Some(stride) = stride {
+                walk_expr(stride, visitor);
+            }
+        }
+    }
+}
+
+fn collect_equality_param_pairs_from_expr(expr: &Expr, pairs: &mut Vec<EqualityParam>) {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if *op == BinaryOperator::Eq {
+                collect_equality_param_pairs_from_exprs(left, right, pairs);
+            }
         }
         Expr::InList { expr, list, .. } => {
-            collect_expr_equality_params(expr, pairs);
-            for item in list {
-                collect_expr_equality_params(item, pairs);
-            }
+            collect_in_list_param_pairs(expr, list, pairs);
         }
         Expr::Between {
             expr, low, high, ..
         } => {
-            collect_expr_equality_params(expr, pairs);
-            collect_expr_equality_params(low, pairs);
-            collect_expr_equality_params(high, pairs);
+            collect_between_param_pairs(expr, low, high, pairs);
         }
         Expr::Like { expr, pattern, .. }
         | Expr::ILike { expr, pattern, .. }
         | Expr::SimilarTo { expr, pattern, .. }
         | Expr::RLike { expr, pattern, .. } => {
-            collect_expr_equality_params(expr, pairs);
-            collect_expr_equality_params(pattern, pairs);
+            collect_binary_param_pair(expr, pattern, pairs);
         }
-        Expr::AnyOp { left, right, .. } | Expr::AllOp { left, right, .. } => {
-            collect_expr_equality_params(left, pairs);
-            collect_expr_equality_params(right, pairs);
-        }
-        Expr::IsFalse(expr)
-        | Expr::IsNotFalse(expr)
-        | Expr::IsTrue(expr)
-        | Expr::IsNotTrue(expr)
-        | Expr::IsNull(expr)
-        | Expr::IsNotNull(expr)
-        | Expr::IsUnknown(expr)
-        | Expr::IsNotUnknown(expr) => collect_expr_equality_params(expr, pairs),
         Expr::IsDistinctFrom(left, right) | Expr::IsNotDistinctFrom(left, right) => {
-            collect_expr_equality_params(left, pairs);
-            collect_expr_equality_params(right, pairs);
-        }
-        Expr::IsNormalized { expr, .. } => collect_expr_equality_params(expr, pairs),
-        Expr::Function(function) => {
-            collect_function_arguments_equality_params(&function.parameters, pairs);
-            collect_function_arguments_equality_params(&function.args, pairs);
-            if let Some(filter) = &function.filter {
-                collect_expr_equality_params(filter, pairs);
-            }
-        }
-        Expr::Tuple(items) => {
-            for item in items {
-                collect_expr_equality_params(item, pairs);
-            }
-        }
-        Expr::Struct { values, .. } => {
-            for value in values {
-                collect_expr_equality_params(value, pairs);
-            }
-        }
-        Expr::GroupingSets(groups) | Expr::Cube(groups) | Expr::Rollup(groups) => {
-            for group in groups {
-                for item in group {
-                    collect_expr_equality_params(item, pairs);
-                }
-            }
+            collect_null_safe_equality_param_pairs_from_exprs(left, right, pairs);
         }
         _ => {}
     }
 }
 
-fn collect_function_arguments_equality_params(
-    arguments: &FunctionArguments,
+fn collect_equality_param_pairs_from_exprs(
+    left: &Expr,
+    right: &Expr,
     pairs: &mut Vec<EqualityParam>,
 ) {
-    match arguments {
-        FunctionArguments::None => {}
-        FunctionArguments::Subquery(query) => collect_query_equality_params(query, true, pairs),
-        FunctionArguments::List(arguments) => {
-            for arg in &arguments.args {
-                collect_function_arg_equality_params(arg, pairs);
+    if let (Some(left_items), Some(right_items)) =
+        (tuple_items_from_expr(left), tuple_items_from_expr(right))
+    {
+        for (left_item, right_item) in left_items.iter().zip(right_items.iter()) {
+            if let Some(pair) = equality_param_from_exprs(left_item, right_item) {
+                pairs.push(pair);
+            }
+        }
+        return;
+    }
+
+    if let Some(pair) = equality_param_from_exprs(left, right) {
+        pairs.push(pair);
+    }
+}
+
+fn collect_in_list_param_pairs(expr: &Expr, list: &[Expr], pairs: &mut Vec<EqualityParam>) {
+    if let Some((qualifier, column)) = column_name_from_expr(expr) {
+        for item in list {
+            if let Some(param) = named_param_from_expr(item) {
+                pairs.push(EqualityParam {
+                    qualifier: qualifier.clone(),
+                    column: column.clone(),
+                    param,
+                });
+            }
+        }
+        return;
+    }
+
+    let Some(columns) = tuple_items_from_expr(expr) else {
+        return;
+    };
+    for item in list {
+        let Some(values) = tuple_items_from_expr(item) else {
+            continue;
+        };
+        for (column, value) in columns.iter().zip(values.iter()) {
+            if let (Some((qualifier, column)), Some(param)) =
+                (column_name_from_expr(column), named_param_from_expr(value))
+            {
+                pairs.push(EqualityParam {
+                    qualifier,
+                    column,
+                    param,
+                });
             }
         }
     }
 }
 
-fn collect_function_arg_equality_params(arg: &FunctionArg, pairs: &mut Vec<EqualityParam>) {
-    match arg {
-        FunctionArg::Named { arg, .. } | FunctionArg::Unnamed(arg) => {
-            collect_function_arg_expr_equality_params(arg, pairs);
-        }
-        FunctionArg::ExprNamed { name, arg, .. } => {
-            collect_expr_equality_params(name, pairs);
-            collect_function_arg_expr_equality_params(arg, pairs);
-        }
+fn collect_between_param_pairs(
+    expr: &Expr,
+    low: &Expr,
+    high: &Expr,
+    pairs: &mut Vec<EqualityParam>,
+) {
+    collect_binary_param_pair(expr, low, pairs);
+    collect_binary_param_pair(expr, high, pairs);
+}
+
+fn collect_binary_param_pair(left: &Expr, right: &Expr, pairs: &mut Vec<EqualityParam>) {
+    if let Some(pair) = equality_param_from_exprs(left, right) {
+        pairs.push(pair);
     }
 }
 
-fn collect_function_arg_expr_equality_params(
-    arg: &FunctionArgExpr,
+fn collect_null_safe_equality_param_pairs_from_exprs(
+    left: &Expr,
+    right: &Expr,
     pairs: &mut Vec<EqualityParam>,
 ) {
-    if let FunctionArgExpr::Expr(expr) = arg {
-        collect_expr_equality_params(expr, pairs);
+    let before = pairs.len();
+    collect_equality_param_pairs_from_exprs(left, right, pairs);
+    if pairs.len() != before {
+        return;
+    }
+
+    // sqlparser-rs 0.62 can include a trailing boolean chain in the RHS of
+    // `IS [NOT] DISTINCT FROM`. The immediate left operand of that chain is
+    // the value being compared; the recursive visitor handles the rest.
+    if let Expr::BinaryOp {
+        left: immediate_right,
+        op,
+        ..
+    } = right
+    {
+        if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
+            collect_equality_param_pairs_from_exprs(left, immediate_right, pairs);
+        }
     }
 }
 
@@ -573,6 +1215,14 @@ fn equality_param_from_exprs(left: &Expr, right: &Expr) -> Option<EqualityParam>
         column,
         param,
     })
+}
+
+fn tuple_items_from_expr(expr: &Expr) -> Option<&[Expr]> {
+    match expr {
+        Expr::Tuple(items) => Some(items),
+        Expr::Nested(expr) => tuple_items_from_expr(expr),
+        _ => None,
+    }
 }
 
 fn column_name_from_expr(expr: &Expr) -> Option<(Option<String>, String)> {
@@ -1761,6 +2411,91 @@ mod tests {
     }
 
     #[test]
+    fn sqlparser_ast_lowerer_parses_create_table_schema() {
+        let statement = parse_create_table_with_sqlparser(
+            r#"
+            CREATE TABLE "accounts" (
+                "id" BIGINT,
+                "email" TEXT NOT NULL,
+                "display_name" TEXT,
+                CONSTRAINT accounts_pk PRIMARY KEY ("id")
+            );
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(statement.table, "accounts");
+        assert_eq!(statement.columns.len(), 3);
+        assert_eq!(statement.columns[0].name, "id");
+        assert_eq!(statement.columns[0].declared_type, "BIGINT");
+        assert_eq!(statement.columns[0].nullable, ColumnNullability::NonNull);
+        assert_eq!(statement.columns[1].name, "email");
+        assert_eq!(statement.columns[1].nullable, ColumnNullability::NonNull);
+        assert_eq!(statement.columns[2].name, "display_name");
+        assert_eq!(statement.columns[2].nullable, ColumnNullability::Nullable);
+    }
+
+    #[test]
+    fn sqlparser_ast_lowerer_parses_mutation_params() {
+        let insert = parse_mutation(
+            "INSERT INTO users (email, org_id) VALUES (:email_address, CAST(:org_id AS INTEGER))",
+        )
+        .unwrap();
+        assert_eq!(insert.table, "users");
+        assert_eq!(
+            insert.column_params,
+            vec![
+                MutationColumnParam {
+                    column: "email".to_string(),
+                    param: "email_address".to_string()
+                },
+                MutationColumnParam {
+                    column: "org_id".to_string(),
+                    param: "org_id".to_string()
+                }
+            ]
+        );
+
+        let update = parse_mutation(
+            "UPDATE users SET email = :new_email, active = :active WHERE id = :user_id",
+        )
+        .unwrap();
+        assert_eq!(update.table, "users");
+        assert_eq!(
+            update.column_params,
+            vec![
+                MutationColumnParam {
+                    column: "email".to_string(),
+                    param: "new_email".to_string()
+                },
+                MutationColumnParam {
+                    column: "active".to_string(),
+                    param: "active".to_string()
+                }
+            ]
+        );
+        assert_eq!(
+            update.equality_params,
+            vec![EqualityParam {
+                qualifier: None,
+                column: "id".to_string(),
+                param: "user_id".to_string()
+            }]
+        );
+
+        let delete = parse_mutation("DELETE FROM users WHERE id = :user_id").unwrap();
+        assert_eq!(delete.table, "users");
+        assert_eq!(
+            delete.equality_params,
+            vec![EqualityParam {
+                qualifier: None,
+                column: "id".to_string(),
+                param: "user_id".to_string()
+            }]
+        );
+    }
+
+    #[test]
     fn parses_select_into_ir() {
         let statement = parse_select(
             "SELECT id, lower(email) AS lower_email, email || '' AS email_expr FROM users WHERE id = :id AND email = :email;",
@@ -1917,7 +2652,6 @@ mod tests {
              WHERE u.id = :id",
         )
         .unwrap();
-
         assert_eq!(
             statement.table_refs,
             vec![
@@ -2033,7 +2767,6 @@ mod tests {
             ",
         )
         .unwrap();
-
         assert_eq!(
             statement.equality_params,
             vec![
@@ -2061,6 +2794,149 @@ mod tests {
                     qualifier: Some("u".to_string()),
                     column: "parent_id".to_string(),
                     param: "parent_id".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlparser_ast_lowerer_extracts_tuple_and_in_list_params() {
+        let statement = parse_select_with_sqlparser(
+            "
+            SELECT u.id
+            FROM users u
+            WHERE (u.id, u.org_id) = (:id, :org_id)
+              AND u.email IN (:email_one, :email_two)
+              AND (u.parent_id, u.active) IN ((:parent_id, :active))
+            ",
+        )
+        .unwrap();
+
+        assert_eq!(
+            statement.equality_params,
+            vec![
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "id".to_string(),
+                    param: "id".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "org_id".to_string(),
+                    param: "org_id".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "email".to_string(),
+                    param: "email_one".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "email".to_string(),
+                    param: "email_two".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "parent_id".to_string(),
+                    param: "parent_id".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "active".to_string(),
+                    param: "active".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlparser_ast_lowerer_extracts_range_pattern_and_distinct_params() {
+        let statement = parse_select_with_sqlparser(
+            "
+            SELECT u.id
+            FROM users u
+            WHERE u.created_at BETWEEN :start_at AND :end_at
+              AND u.email LIKE :email_pattern
+              AND u.slug ILIKE :slug_pattern
+              AND u.external_id IS NOT DISTINCT FROM :external_id
+              AND :parent_id IS DISTINCT FROM u.parent_id
+            ",
+        )
+        .unwrap();
+
+        assert_eq!(
+            statement.equality_params,
+            vec![
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "created_at".to_string(),
+                    param: "start_at".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "created_at".to_string(),
+                    param: "end_at".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "email".to_string(),
+                    param: "email_pattern".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "slug".to_string(),
+                    param: "slug_pattern".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "external_id".to_string(),
+                    param: "external_id".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("u".to_string()),
+                    column: "parent_id".to_string(),
+                    param: "parent_id".to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn ast_visitor_extracts_params_from_non_where_query_paths() {
+        let statement = parse_select_with_sqlparser(
+            "
+            SELECT count(*) FILTER (WHERE e.kind = :kind) AS filtered_count
+            FROM emails e
+            GROUP BY e.user_id
+            HAVING e.created_at = :created_at
+            ORDER BY CASE WHEN e.email = :email THEN 0 ELSE 1 END
+            LIMIT CASE WHEN e.id = :limit_id THEN 1 ELSE 2 END
+            ",
+        )
+        .unwrap();
+
+        assert_eq!(
+            statement.equality_params,
+            vec![
+                EqualityParam {
+                    qualifier: Some("e".to_string()),
+                    column: "kind".to_string(),
+                    param: "kind".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("e".to_string()),
+                    column: "created_at".to_string(),
+                    param: "created_at".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("e".to_string()),
+                    column: "email".to_string(),
+                    param: "email".to_string()
+                },
+                EqualityParam {
+                    qualifier: Some("e".to_string()),
+                    column: "id".to_string(),
+                    param: "limit_id".to_string()
                 }
             ]
         );

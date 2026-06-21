@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: fmt, check, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo check --workspace --all-features
+      - run: cargo test --workspace --all-features
+
+  postgres-e2e:
+    name: postgres e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: QUERYFORGE_E2E_POSTGRES=1 cargo test -p queryforge --features postgres --test postgres_e2e -- --nocapture
+
+  remote-libsql-e2e:
+    name: remote libSQL e2e
+    runs-on: ubuntu-latest
+    env:
+      QUERYFORGE_E2E_LIBSQL_REMOTE: "1"
+      QUERYFORGE_LIBSQL_REMOTE_URL: ${{ secrets.LIBSQL_REMOTE_URL }}
+      QUERYFORGE_LIBSQL_AUTH_TOKEN: ${{ secrets.LIBSQL_AUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run remote libSQL e2e
+        if: ${{ env.QUERYFORGE_LIBSQL_REMOTE_URL != '' && env.QUERYFORGE_LIBSQL_AUTH_TOKEN != '' }}
+        run: cargo test -p queryforge --features libsql-remote --test libsql_remote_e2e -- --nocapture
+      - name: Skip remote libSQL e2e
+        if: ${{ env.QUERYFORGE_LIBSQL_REMOTE_URL == '' || env.QUERYFORGE_LIBSQL_AUTH_TOKEN == '' }}
+        run: echo "Skipping remote libSQL e2e because LIBSQL_REMOTE_URL or LIBSQL_AUTH_TOKEN is not configured."

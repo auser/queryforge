@@ -4,7 +4,8 @@ use quote::quote;
 use crate::ir::{Cardinality, QueryShape};
 
 use super::{
-    format_query_tokens, lit_str, parse_type, pascal_ident, rust_type, snake_ident, upper_ident,
+    format_query_tokens, lit_str, parse_type, pascal_ident, rendered_columns, snake_ident,
+    upper_ident,
 };
 
 pub fn render_query(query: &QueryShape) -> String {
@@ -90,15 +91,16 @@ fn render_row_struct(query: &QueryShape, row_name: &proc_macro2::Ident) -> Token
         return TokenStream::new();
     }
 
-    let fields = query.columns.iter().map(|column| {
-        let field = snake_ident(&column.rust_name);
-        let ty = rust_type(&column.rust_type.0, &column.nullable);
+    let columns = rendered_columns(query);
+    let fields = columns.iter().map(|column| {
+        let field = &column.field;
+        let ty = &column.ty;
         quote! { pub #field: #ty }
     });
-    let getters = query.columns.iter().map(|column| {
-        let field = snake_ident(&column.rust_name);
-        let name = lit_str(&column.name);
-        quote! { #field: row.try_get(#name)? }
+    let getters = columns.iter().map(|column| {
+        let field = &column.field;
+        let index = &column.index;
+        quote! { #field: row.try_get_index(#index)? }
     });
 
     quote! {

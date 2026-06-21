@@ -15,7 +15,7 @@ use crate::names::{to_pascal_case, to_snake_case};
 use crate::nullability::wrap_nullable;
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
-use syn::{LitStr, Type};
+use syn::{Index, LitStr, Type};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedFile {
@@ -169,6 +169,38 @@ pub(crate) fn parse_type(value: &str) -> Type {
     syn::parse_str(value).unwrap_or_else(|err| panic!("invalid Rust type `{value}`: {err}"))
 }
 
+pub(crate) struct RenderedColumn {
+    pub field: Ident,
+    pub ty: Type,
+    pub index: Index,
+}
+
+pub(crate) fn rendered_columns(query: &crate::ir::QueryShape) -> Vec<RenderedColumn> {
+    let mut seen = BTreeMap::<String, usize>::new();
+    query
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| {
+            let base = to_snake_case(&column.rust_name);
+            let count = seen.entry(base.clone()).or_insert(0);
+            let field_name = if *count == 0 {
+                base
+            } else {
+                let logical = base.strip_prefix("r#").unwrap_or(&base);
+                to_snake_case(&format!("{}_{}", logical, *count + 1))
+            };
+            *count += 1;
+
+            RenderedColumn {
+                field: format_ident!("{}", field_name),
+                ty: rust_type(&column.rust_type.0, &column.nullable),
+                index: Index::from(index),
+            }
+        })
+        .collect()
+}
+
 fn write_if_changed(path: PathBuf, content: &str, written: &mut Vec<PathBuf>) -> Result<()> {
     if path.exists() && fs::read_to_string(&path)? == content {
         return Ok(());
@@ -274,8 +306,8 @@ mod tests {
                 "        row: queryforge::runtime::libsql_executor::LibsqlRow,\n",
                 "    ) -> Result<Self, Self::Error> {\n",
                 "        Ok(Self {\n",
-                "            id: row.try_get(\"id\")?,\n",
-                "            email: row.try_get(\"email\")?,\n",
+                "            id: row.try_get_index(0)?,\n",
+                "            email: row.try_get_index(1)?,\n",
                 "        })\n",
                 "    }\n",
                 "}\n",
@@ -291,6 +323,51 @@ mod tests {
         );
 
         fs::remove_dir_all(out_dir).ok();
+    }
+
+    #[test]
+    fn rendered_columns_are_unique_for_join_duplicate_names() {
+        let mut query = row_query();
+        query.columns = vec![
+            QueryColumn {
+                name: "id".to_string(),
+                rust_name: "id".to_string(),
+                db_type: Some("sqlite:INTEGER".to_string()),
+                rust_type: RustType::new("i64"),
+                nullable: Nullability::NonNull,
+                source: TypeSource::SchemaCatalog,
+                confidence: InferenceConfidence::Strong,
+            },
+            QueryColumn {
+                name: "id".to_string(),
+                rust_name: "id".to_string(),
+                db_type: Some("sqlite:INTEGER".to_string()),
+                rust_type: RustType::new("i64"),
+                nullable: Nullability::NonNull,
+                source: TypeSource::SchemaCatalog,
+                confidence: InferenceConfidence::Strong,
+            },
+            QueryColumn {
+                name: "type".to_string(),
+                rust_name: "type".to_string(),
+                db_type: Some("sqlite:TEXT".to_string()),
+                rust_type: RustType::string(),
+                nullable: Nullability::Nullable,
+                source: TypeSource::SchemaCatalog,
+                confidence: InferenceConfidence::Strong,
+            },
+        ];
+
+        let columns = rendered_columns(&query);
+        let fields = columns
+            .iter()
+            .map(|column| column.field.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(fields, vec!["id", "id_2", "r#type"]);
+        assert_eq!(columns[0].index.index, 0);
+        assert_eq!(columns[1].index.index, 1);
+        assert_eq!(columns[2].index.index, 2);
     }
 
     fn query(name: &str, sql: &str) -> QueryShape {

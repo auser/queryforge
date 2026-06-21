@@ -2,7 +2,7 @@
 
 // queryforge:query:get_user
 pub const GET_USER_SQL: &str = "SELECT id, email, created_at\nFROM users\nWHERE id = ?1;";
-pub const GET_USER_FINGERPRINT: &str = "fnv1a64:58237df3447293e9";
+pub const GET_USER_FINGERPRINT: &str = "fnv1a64:5ab370cae0d0648f";
 pub fn get_user_sql() -> &'static str {
     GET_USER_SQL
 }
@@ -18,9 +18,9 @@ impl TryFrom<queryforge::runtime::libsql_executor::LibsqlRow> for GetUserRow {
         row: queryforge::runtime::libsql_executor::LibsqlRow,
     ) -> Result<Self, Self::Error> {
         Ok(Self {
-            id: row.try_get("id")?,
-            email: row.try_get("email")?,
-            created_at: row.try_get("created_at")?,
+            id: row.try_get_index(0)?,
+            email: row.try_get_index(1)?,
+            created_at: row.try_get_index(2)?,
         })
     }
 }
@@ -35,7 +35,7 @@ where
 
 // queryforge:query:list_users
 pub const LIST_USERS_SQL: &str = "SELECT id, email, created_at\nFROM users\nORDER BY created_at DESC;";
-pub const LIST_USERS_FINGERPRINT: &str = "fnv1a64:1de6b5e8d61b1192";
+pub const LIST_USERS_FINGERPRINT: &str = "fnv1a64:52668af21ce9aeb4";
 pub fn list_users_sql() -> &'static str {
     LIST_USERS_SQL
 }
@@ -51,9 +51,9 @@ impl TryFrom<queryforge::runtime::libsql_executor::LibsqlRow> for ListUsersRow {
         row: queryforge::runtime::libsql_executor::LibsqlRow,
     ) -> Result<Self, Self::Error> {
         Ok(Self {
-            id: row.try_get("id")?,
-            email: row.try_get("email")?,
-            created_at: row.try_get("created_at")?,
+            id: row.try_get_index(0)?,
+            email: row.try_get_index(1)?,
+            created_at: row.try_get_index(2)?,
         })
     }
 }

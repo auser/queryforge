@@ -4,7 +4,8 @@ use quote::quote;
 use crate::ir::{Cardinality, QueryShape};
 
 use super::{
-    format_query_tokens, lit_str, parse_type, pascal_ident, rust_type, snake_ident, upper_ident,
+    format_query_tokens, lit_str, parse_type, pascal_ident, rendered_columns, snake_ident,
+    upper_ident,
 };
 
 pub fn render_query(query: &QueryShape) -> String {
@@ -108,16 +109,31 @@ fn render_row_struct(query: &QueryShape, row_name: &proc_macro2::Ident) -> Token
         return TokenStream::new();
     }
 
-    let fields = query.columns.iter().map(|column| {
-        let field = snake_ident(&column.rust_name);
-        let ty = rust_type(&column.rust_type.0, &column.nullable);
+    let columns = rendered_columns(query);
+    let fields = columns.iter().map(|column| {
+        let field = &column.field;
+        let ty = &column.ty;
         quote! { pub #field: #ty }
+    });
+    let getters = columns.iter().map(|column| {
+        let field = &column.field;
+        let index = &column.index;
+        quote! { #field: row.try_get(#index)? }
     });
 
     quote! {
-        #[derive(Debug, Clone, sqlx::FromRow)]
+        #[derive(Debug, Clone)]
         pub struct #row_name {
             #( #fields, )*
+        }
+
+        impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for #row_name {
+            fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
+                use sqlx::Row as _;
+                Ok(Self {
+                    #( #getters, )*
+                })
+            }
         }
     }
 }
@@ -163,10 +179,19 @@ mod tests {
                 "pub fn get_user_sql() -> &'static str {\n",
                 "    GET_USER_SQL\n",
                 "}\n",
-                "#[derive(Debug, Clone, sqlx::FromRow)]\n",
+                "#[derive(Debug, Clone)]\n",
                 "pub struct GetUserRow {\n",
                 "    pub id: i64,\n",
                 "    pub email: Option<String>,\n",
+                "}\n",
+                "impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for GetUserRow {\n",
+                "    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {\n",
+                "        use sqlx::Row as _;\n",
+                "        Ok(Self {\n",
+                "            id: row.try_get(0)?,\n",
+                "            email: row.try_get(1)?,\n",
+                "        })\n",
+                "    }\n",
                 "}\n",
                 "pub async fn get_user<'e, E>(executor: E, id: i64) -> Result<GetUserRow, sqlx::Error>\n",
                 "where\n",

@@ -2,6 +2,7 @@
 pub const QUERYFORGE_VERSION: &str = "0.1.0";
 pub const QUERYFORGE_BACKEND: &str = "libsql";
 pub const QUERYFORGE_EXECUTION_TARGET: &str = "libsql-native";
-pub const QUERYFORGE_FINGERPRINT: &str = "fnv1a64:a7487c8dff4641de";
+pub const QUERYFORGE_FINGERPRINT: &str = "fnv1a64:6923820ad1400fde";
 pub const QUERYFORGE_SCHEMA_FINGERPRINT: &str = "fnv1a64:0090fa7978455e72";
 pub const QUERYFORGE_MIGRATION_FINGERPRINT: &str = "fnv1a64:cbf29ce484222325";
+pub const QUERYFORGE_TYPE_MAPPING_FINGERPRINT: &str = "fnv1a64:b71eec8b3fd8129f";

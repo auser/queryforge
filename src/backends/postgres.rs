@@ -1926,5 +1926,32 @@ mod tests {
             ),
             BTreeSet::from(["accounts".to_string(), "organizations".to_string()])
         );
+        assert_eq!(
+            nullable_join_tables(
+                sql_ir::parse_select(
+                    "SELECT u.id, o.name, a.slug \
+                     FROM (users u LEFT JOIN organizations o ON o.id = u.org_id) \
+                     RIGHT JOIN accounts a ON a.org_id = o.id"
+                )
+                .as_ref()
+            ),
+            BTreeSet::from(["organizations".to_string(), "users".to_string()])
+        );
+        assert_eq!(
+            nullable_join_tables(
+                sql_ir::parse_select(
+                    "SELECT u.id, o.name, a.slug, m.role \
+                     FROM users u \
+                     LEFT JOIN (organizations o RIGHT JOIN accounts a ON a.org_id = o.id \
+                       LEFT JOIN memberships m ON m.account_id = a.id) ON o.id = u.org_id"
+                )
+                .as_ref()
+            ),
+            BTreeSet::from([
+                "accounts".to_string(),
+                "memberships".to_string(),
+                "organizations".to_string()
+            ])
+        );
     }
 }

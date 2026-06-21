@@ -51,6 +51,12 @@ impl std::fmt::Display for ExecutionTarget {
 pub struct DatabaseConfig {
     pub backend: DatabaseBackend,
     pub url: String,
+
+    #[serde(default)]
+    pub auth_token: Option<String>,
+
+    #[serde(default)]
+    pub auth_token_env: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -319,6 +325,7 @@ mod tests {
             [database]
             backend = "libsql"
             url = "file:test.db"
+            auth_token_env = "LIBSQL_AUTH_TOKEN"
 
             [codegen]
             out_dir = "src/db"
@@ -337,6 +344,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.database.backend, DatabaseBackend::Libsql);
+        assert_eq!(config.database.auth_token, None);
+        assert_eq!(
+            config.database.auth_token_env.as_deref(),
+            Some("LIBSQL_AUTH_TOKEN")
+        );
         assert_eq!(
             config.codegen.execution_target,
             ExecutionTarget::LibsqlNative
